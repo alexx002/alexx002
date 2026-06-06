@@ -387,8 +387,7 @@ def health() -> dict[str, Any]:
 
 
 @app.post("/activate")
-def activate(payload: ActivationRequest, x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
-    _require_api_token(x_api_token)
+def activate(payload: ActivationRequest) -> dict[str, Any]:
     if _normalize_license_key(payload.product_code) != _normalize_license_key(str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE)):
         raise HTTPException(status_code=400, detail="product_code invalide.")
 
@@ -515,8 +514,7 @@ def activate(payload: ActivationRequest, x_api_token: str | None = Header(defaul
 
 
 @app.post("/validate")
-def validate(payload: ValidationRequest, x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
-    _require_api_token(x_api_token)
+def validate(payload: ValidationRequest) -> dict[str, Any]:
     if _normalize_license_key(payload.product_code) != _normalize_license_key(str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE)):
         raise HTTPException(status_code=400, detail="product_code invalide.")
 
@@ -607,8 +605,7 @@ def validate(payload: ValidationRequest, x_api_token: str | None = Header(defaul
 
 
 @app.post("/deactivate")
-def deactivate(payload: DeactivationRequest, x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
-    _require_api_token(x_api_token)
+def deactivate(payload: DeactivationRequest) -> dict[str, Any]:
     if _normalize_license_key(payload.product_code) != _normalize_license_key(str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE)):
         raise HTTPException(status_code=400, detail="product_code invalide.")
 
