@@ -2,20 +2,15 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import json
 import secrets
 import sqlite3
-import threading
-import time
-from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 
@@ -24,44 +19,9 @@ DB_PATH = Path("data") / "license_server.db"
 SETTINGS_PATH = Path("data") / "license_server_settings.json"
 DEFAULT_PRODUCT_CODE = "EventManagerPro"
 DEFAULT_API_TOKEN = "CHANGE_ME"
-ENV_API_TOKEN_NAME = "LICENSE_SERVER_API_TOKEN"
 DEFAULT_MAX_DEVICES = 2
 DEFAULT_LICENSE_DURATION_DAYS = 365
 DEFAULT_OFFLINE_GRACE_DAYS = 7
-
-RATE_LIMIT_MAX_REQUESTS = 20
-RATE_LIMIT_WINDOW_SECONDS = 60
-RATE_LIMIT_PROTECTED_PATHS = {"/activate", "/validate", "/deactivate"}
-
-
-class _InMemoryRateLimiter:
-    def __init__(self, max_requests: int, window_seconds: int) -> None:
-        self.max_requests = int(max_requests)
-        self.window_seconds = int(window_seconds)
-        self._hits: dict[str, deque[float]] = defaultdict(deque)
-        self._lock = threading.Lock()
-
-    def allow(self, key: str) -> bool:
-        now = time.time()
-        cutoff = now - self.window_seconds
-
-        with self._lock:
-            bucket = self._hits[key]
-
-            while bucket and bucket[0] < cutoff:
-                bucket.popleft()
-
-            if len(bucket) >= self.max_requests:
-                return False
-
-            bucket.append(now)
-            return True
-
-
-RATE_LIMITER = _InMemoryRateLimiter(
-    max_requests=RATE_LIMIT_MAX_REQUESTS,
-    window_seconds=RATE_LIMIT_WINDOW_SECONDS,
-)
 
 
 def _utc_now() -> datetime:
@@ -267,12 +227,12 @@ def _log_event(
 
 
 def _require_api_token(x_api_token: str | None) -> None:
-    expected = _normalize_token(os.getenv(ENV_API_TOKEN_NAME)) or _normalize_token(SETTINGS.get("api_token"))
+    expected = _normalize_token(SETTINGS.get("api_token"))
     got = _normalize_token(x_api_token)
     if not expected or expected == DEFAULT_API_TOKEN:
         raise HTTPException(
             status_code=503,
-            detail="api_token non configuré côté serveur. Définis LICENSE_SERVER_API_TOKEN sur Render ou modifie data/license_server_settings.json.",
+            detail="api_token non configuré côté serveur. Modifie data/license_server_settings.json.",
         )
     if not secrets.compare_digest(got, expected):
         raise HTTPException(status_code=401, detail="Token API invalide.")
@@ -361,15 +321,6 @@ def _find_activation(
     ).fetchone()
 
 
-def _get_client_ip(request: Request) -> str:
-    forwarded_for = request.headers.get("x-forwarded-for", "").strip()
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    if request.client and request.client.host:
-        return request.client.host
-    return "unknown"
-
-
 class ActivationRequest(BaseModel):
     product_code: str = Field(default=DEFAULT_PRODUCT_CODE)
     app_name: str = Field(default=DEFAULT_PRODUCT_CODE)
@@ -423,22 +374,6 @@ _ensure_schema()
 _seed_demo_license()
 
 app = FastAPI(title=APP_TITLE)
-
-
-@app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    if request.url.path in RATE_LIMIT_PROTECTED_PATHS:
-        client_ip = _get_client_ip(request)
-        rate_limit_key = f"{request.url.path}:{client_ip}"
-        if not RATE_LIMITER.allow(rate_limit_key):
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "ok": False,
-                    "detail": "Trop de requêtes. Réessaie plus tard.",
-                },
-            )
-    return await call_next(request)
 
 
 @app.get("/health")
@@ -885,6 +820,45 @@ def list_activations(license_key: str, x_api_token: str | None = Header(default=
                 }
                 for a in acts
             ],
+        }
+
+
+@app.delete("/admin/licenses/{license_key}")
+def delete_license(license_key: str, x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
+    _require_api_token(x_api_token)
+    now = _utc_now()
+    normalized_license_key = _normalize_license_key(license_key)
+
+    with _db() as con:
+        row = _get_license_row(con, normalized_license_key)
+        activation_row = con.execute(
+            "SELECT COUNT(*) AS n FROM activations WHERE license_id=?",
+            (int(row["id"]),),
+        ).fetchone()
+        deleted_activations = int(activation_row["n"] if activation_row else 0)
+
+        _log_event(
+            "admin_delete_license",
+            license_key=normalized_license_key,
+            details={"deleted_activations": deleted_activations},
+            con=con,
+        )
+
+        con.execute(
+            "DELETE FROM activations WHERE license_id=?",
+            (int(row["id"]),),
+        )
+        con.execute(
+            "DELETE FROM licenses WHERE id=?",
+            (int(row["id"]),),
+        )
+
+        return {
+            "ok": True,
+            "license_key": normalized_license_key,
+            "deleted": True,
+            "deleted_activations": deleted_activations,
+            "deleted_at": _iso(now),
         }
 
 
