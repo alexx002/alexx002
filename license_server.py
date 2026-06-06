@@ -5,12 +5,16 @@ import hashlib
 import json
 import secrets
 import sqlite3
+import threading
+import time
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 
@@ -22,6 +26,40 @@ DEFAULT_API_TOKEN = "CHANGE_ME"
 DEFAULT_MAX_DEVICES = 2
 DEFAULT_LICENSE_DURATION_DAYS = 365
 DEFAULT_OFFLINE_GRACE_DAYS = 7
+
+RATE_LIMIT_MAX_REQUESTS = 20
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_PROTECTED_PATHS = {"/activate", "/validate", "/deactivate"}
+
+
+class _InMemoryRateLimiter:
+    def __init__(self, max_requests: int, window_seconds: int) -> None:
+        self.max_requests = int(max_requests)
+        self.window_seconds = int(window_seconds)
+        self._hits: dict[str, deque[float]] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        now = time.time()
+        cutoff = now - self.window_seconds
+
+        with self._lock:
+            bucket = self._hits[key]
+
+            while bucket and bucket[0] < cutoff:
+                bucket.popleft()
+
+            if len(bucket) >= self.max_requests:
+                return False
+
+            bucket.append(now)
+            return True
+
+
+RATE_LIMITER = _InMemoryRateLimiter(
+    max_requests=RATE_LIMIT_MAX_REQUESTS,
+    window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+)
 
 
 def _utc_now() -> datetime:
@@ -321,6 +359,15 @@ def _find_activation(
     ).fetchone()
 
 
+def _get_client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "").strip()
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
 class ActivationRequest(BaseModel):
     product_code: str = Field(default=DEFAULT_PRODUCT_CODE)
     app_name: str = Field(default=DEFAULT_PRODUCT_CODE)
@@ -374,6 +421,22 @@ _ensure_schema()
 _seed_demo_license()
 
 app = FastAPI(title=APP_TITLE)
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    if request.url.path in RATE_LIMIT_PROTECTED_PATHS:
+        client_ip = _get_client_ip(request)
+        rate_limit_key = f"{request.url.path}:{client_ip}"
+        if not RATE_LIMITER.allow(rate_limit_key):
+            return JSONResponse(
+                status_code=429,
+                content={
+                    "ok": False,
+                    "detail": "Trop de requêtes. Réessaie plus tard.",
+                },
+            )
+    return await call_next(request)
 
 
 @app.get("/health")
