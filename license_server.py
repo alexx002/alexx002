@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 import secrets
 import sqlite3
@@ -23,6 +24,7 @@ DB_PATH = Path("data") / "license_server.db"
 SETTINGS_PATH = Path("data") / "license_server_settings.json"
 DEFAULT_PRODUCT_CODE = "EventManagerPro"
 DEFAULT_API_TOKEN = "CHANGE_ME"
+ENV_API_TOKEN_NAME = "LICENSE_SERVER_API_TOKEN"
 DEFAULT_MAX_DEVICES = 2
 DEFAULT_LICENSE_DURATION_DAYS = 365
 DEFAULT_OFFLINE_GRACE_DAYS = 7
@@ -265,12 +267,12 @@ def _log_event(
 
 
 def _require_api_token(x_api_token: str | None) -> None:
-    expected = _normalize_token(SETTINGS.get("api_token"))
+    expected = _normalize_token(os.getenv(ENV_API_TOKEN_NAME)) or _normalize_token(SETTINGS.get("api_token"))
     got = _normalize_token(x_api_token)
     if not expected or expected == DEFAULT_API_TOKEN:
         raise HTTPException(
             status_code=503,
-            detail="api_token non configuré côté serveur. Modifie data/license_server_settings.json.",
+            detail="api_token non configuré côté serveur. Définis LICENSE_SERVER_API_TOKEN sur Render ou modifie data/license_server_settings.json.",
         )
     if not secrets.compare_digest(got, expected):
         raise HTTPException(status_code=401, detail="Token API invalide.")
