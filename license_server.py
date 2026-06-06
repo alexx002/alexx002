@@ -180,7 +180,8 @@ def _seed_demo_license() -> None:
                 license_key, product_code, customer_name, plan_name, status,
                 max_devices, offline_grace_days, expires_at, created_at, updated_at, notes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+            """
+            ,
             (
                 "DEMO-EVENT-0001",
                 str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE),
@@ -204,22 +205,25 @@ def _log_event(
     activation_id: str = "",
     machine_hash: str = "",
     details: Optional[dict[str, Any]] = None,
+    con: sqlite3.Connection | None = None,
 ) -> None:
-    with _db() as con:
-        con.execute(
-            """
-            INSERT INTO audit_log(event_type, license_key, activation_id, machine_hash, details_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event_type,
-                _normalize_license_key(license_key),
-                str(activation_id or "").strip(),
-                str(machine_hash or "").strip(),
-                json.dumps(details or {}, ensure_ascii=False),
-                _iso(_utc_now()),
-            ),
-        )
+    sql = """
+        INSERT INTO audit_log(event_type, license_key, activation_id, machine_hash, details_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """
+    params = (
+        event_type,
+        _normalize_license_key(license_key),
+        str(activation_id or "").strip(),
+        str(machine_hash or "").strip(),
+        json.dumps(details or {}, ensure_ascii=False),
+        _iso(_utc_now()),
+    )
+    if con is not None:
+        con.execute(sql, params)
+        return
+    with _db() as local_con:
+        local_con.execute(sql, params)
 
 
 def _require_api_token(x_api_token: str | None) -> None:
@@ -301,7 +305,8 @@ def _find_activation(
             """
             SELECT * FROM activations
             WHERE license_id=? AND activation_id=?
-            """,
+            """
+            ,
             (int(license_id), str(activation_id).strip()),
         ).fetchone()
         if row is not None:
@@ -310,7 +315,8 @@ def _find_activation(
         """
         SELECT * FROM activations
         WHERE license_id=? AND machine_hash=?
-        """,
+        """
+        ,
         (int(license_id), str(machine_hash).strip()),
     ).fetchone()
 
@@ -399,6 +405,7 @@ def activate(payload: ActivationRequest, x_api_token: str | None = Header(defaul
                 license_key=license_key,
                 machine_hash=machine_hash,
                 details={"reason": status_error},
+                con=con,
             )
             raise HTTPException(status_code=403, detail=f"Licence {status_error}.")
 
@@ -415,7 +422,8 @@ def activate(payload: ActivationRequest, x_api_token: str | None = Header(defaul
                 SET machine_id=?, machine_name=?, hostname=?, platform=?, platform_release=?,
                     app_name=?, app_version=?, status='active', last_validated_at=?
                 WHERE id=?
-                """,
+                """
+                ,
                 (
                     payload.machine_id.strip(),
                     payload.machine_name.strip(),
@@ -435,6 +443,7 @@ def activate(payload: ActivationRequest, x_api_token: str | None = Header(defaul
                 license_key=license_key,
                 activation_id=str(existing["activation_id"]),
                 machine_hash=machine_hash,
+                con=con,
             )
             return _row_to_license_payload(
                 license_row,
@@ -453,6 +462,7 @@ def activate(payload: ActivationRequest, x_api_token: str | None = Header(defaul
                 license_key=license_key,
                 machine_hash=machine_hash,
                 details={"reason": "max_devices_reached", "used_devices": used_devices, "max_devices": max_devices},
+                con=con,
             )
             raise HTTPException(status_code=403, detail="Nombre maximal d'appareils atteint.")
 
@@ -464,7 +474,8 @@ def activate(payload: ActivationRequest, x_api_token: str | None = Header(defaul
                 platform, platform_release, app_name, app_version, status,
                 created_at, last_validated_at, last_ip
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, '')
-            """,
+            """
+            ,
             (
                 activation_id,
                 int(license_row["id"]),
@@ -491,6 +502,7 @@ def activate(payload: ActivationRequest, x_api_token: str | None = Header(defaul
             license_key=license_key,
             activation_id=activation_id,
             machine_hash=machine_hash,
+            con=con,
         )
         return _row_to_license_payload(
             license_row,
@@ -521,6 +533,7 @@ def validate(payload: ValidationRequest, x_api_token: str | None = Header(defaul
                 license_key=license_key,
                 machine_hash=machine_hash,
                 details={"reason": status_error},
+                con=con,
             )
             raise HTTPException(status_code=403, detail=f"Licence {status_error}.")
 
@@ -536,6 +549,7 @@ def validate(payload: ValidationRequest, x_api_token: str | None = Header(defaul
                 license_key=license_key,
                 machine_hash=machine_hash,
                 details={"reason": "activation_not_found"},
+                con=con,
             )
             raise HTTPException(status_code=403, detail="Activation introuvable pour ce poste.")
         if str(activation["status"]).strip().lower() != "active":
@@ -545,6 +559,7 @@ def validate(payload: ValidationRequest, x_api_token: str | None = Header(defaul
                 activation_id=str(activation["activation_id"]),
                 machine_hash=machine_hash,
                 details={"reason": "activation_inactive"},
+                con=con,
             )
             raise HTTPException(status_code=403, detail="Activation inactive.")
 
@@ -554,7 +569,8 @@ def validate(payload: ValidationRequest, x_api_token: str | None = Header(defaul
             SET machine_id=?, machine_name=?, hostname=?, platform=?, platform_release=?,
                 app_name=?, app_version=?, last_validated_at=?
             WHERE id=?
-            """,
+            """
+            ,
             (
                 payload.machine_id.strip(),
                 payload.machine_name.strip(),
@@ -578,6 +594,7 @@ def validate(payload: ValidationRequest, x_api_token: str | None = Header(defaul
             license_key=license_key,
             activation_id=str(activation["activation_id"]),
             machine_hash=machine_hash,
+            con=con,
         )
         return _row_to_license_payload(
             license_row,
@@ -612,6 +629,7 @@ def deactivate(payload: DeactivationRequest, x_api_token: str | None = Header(de
                 "deactivate_missing",
                 license_key=license_key,
                 machine_hash=machine_hash,
+                con=con,
             )
             return {
                 "ok": True,
@@ -625,7 +643,8 @@ def deactivate(payload: DeactivationRequest, x_api_token: str | None = Header(de
             UPDATE activations
             SET status='deactivated', last_validated_at=?
             WHERE id=?
-            """,
+            """
+            ,
             (_iso(now), int(activation["id"])),
         )
         con.execute(
@@ -638,6 +657,7 @@ def deactivate(payload: DeactivationRequest, x_api_token: str | None = Header(de
             license_key=license_key,
             activation_id=str(activation["activation_id"]),
             machine_hash=machine_hash,
+            con=con,
         )
         return {
             "ok": True,
@@ -669,7 +689,8 @@ def create_license(payload: CreateLicenseRequest, x_api_token: str | None = Head
                 license_key, product_code, customer_name, plan_name, status,
                 max_devices, offline_grace_days, expires_at, created_at, updated_at, notes
             ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
-            """,
+            """
+            ,
             (
                 license_key,
                 _normalize_license_key(payload.product_code) or DEFAULT_PRODUCT_CODE,
@@ -684,7 +705,7 @@ def create_license(payload: CreateLicenseRequest, x_api_token: str | None = Head
             ),
         )
         row = _get_license_row(con, license_key)
-        _log_event("admin_create_license", license_key=license_key)
+        _log_event("admin_create_license", license_key=license_key, con=con)
         return _row_to_license_payload(
             row,
             used_devices=0,
@@ -738,6 +759,7 @@ def update_license_status(
     if new_status not in {"active", "blocked", "revoked", "expired", "trial"}:
         raise HTTPException(status_code=400, detail="Statut invalide.")
 
+    now = _utc_now()
     with _db() as con:
         row = _get_license_row(con, license_key)
         con.execute(
@@ -745,18 +767,23 @@ def update_license_status(
             (
                 new_status,
                 payload.notes.strip(),
-                _iso(_utc_now()),
+                _iso(now),
                 int(row["id"]),
             ),
         )
         updated = _get_license_row(con, license_key)
         used_devices = _count_active_activations(con, int(updated["id"]))
-        _log_event("admin_update_status", license_key=_normalize_license_key(license_key), details={"status": new_status})
+        _log_event(
+            "admin_update_status",
+            license_key=_normalize_license_key(license_key),
+            details={"status": new_status},
+            con=con,
+        )
         return _row_to_license_payload(
             updated,
             used_devices=used_devices,
-            validated_at=_utc_now(),
-            next_check_at=_utc_now() + timedelta(days=int(updated["offline_grace_days"] or DEFAULT_OFFLINE_GRACE_DAYS)),
+            validated_at=now,
+            next_check_at=now + timedelta(days=int(updated["offline_grace_days"] or DEFAULT_OFFLINE_GRACE_DAYS)),
             message="Statut mis à jour.",
         )
 
@@ -773,7 +800,8 @@ def list_activations(license_key: str, x_api_token: str | None = Header(default=
             FROM activations
             WHERE license_id=?
             ORDER BY id DESC
-            """,
+            """
+            ,
             (int(row["id"]),),
         ).fetchall()
         return {
