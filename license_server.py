@@ -343,10 +343,32 @@ def _license_status_error(license_row: sqlite3.Row) -> Optional[str]:
     return None
 
 
+def _key_compact(value: str) -> str:
+    """Clé réduite à ses seuls caractères significatifs (sans tirets, espaces
+    ni points), en majuscules."""
+    txt = _normalize_license_key(value)
+    for sep in ("-", " ", "\t", "."):
+        txt = txt.replace(sep, "")
+    return txt
+
+
 def _get_license_row(con: sqlite3.Connection, license_key: str) -> sqlite3.Row:
     row = con.execute(
         "SELECT * FROM licenses WHERE license_key=?",
         (_normalize_license_key(license_key),),
+    ).fetchone()
+    if row is not None:
+        return row
+    # Repli tolérant à la mise en forme : une clé saisie ou transmise SANS ses
+    # tirets (« 4C1216B555B205CF » au lieu de « 4C12-16B5-55B2-05CF ») était
+    # jusqu'ici déclarée « Licence introuvable », alors qu'il s'agit de la même
+    # licence. Le client ne voyait qu'un masque « 4C12-****-****-05CF »,
+    # identique dans les deux cas — le problème était donc invisible.
+    # On compare ici sans les séparateurs, sans rien changer au stockage.
+    row = con.execute(
+        "SELECT * FROM licenses "
+        "WHERE REPLACE(REPLACE(REPLACE(UPPER(license_key), '-', ''), ' ', ''), '.', '') = ?",
+        (_key_compact(license_key),),
     ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Licence introuvable.")
@@ -387,6 +409,42 @@ def _find_activation(
         ,
         (int(license_id), str(machine_hash).strip()),
     ).fetchone()
+
+
+def _license_row_from_activation(con: sqlite3.Connection, activation_id: str,
+                                 machine_hash: str) -> sqlite3.Row:
+    """Retrouve la licence à partir de l'ACTIVATION, quand la clé n'est pas
+    transmise.
+
+    Le logiciel client ne conserve JAMAIS la clé en clair sur le poste (par
+    sécurité : seuls un masque et une empreinte sont stockés). Il valide donc
+    avec son `activation_id`, la clé partant vide. Le serveur exigeait
+    pourtant la clé et répondait « Licence introuvable » — un message d'autant
+    plus trompeur que la licence existait bel et bien, et que l'utilisateur
+    voyait sa clé masquée affichée correctement dans le logiciel.
+    """
+    row = None
+    aid = str(activation_id or "").strip()
+    if aid:
+        row = con.execute(
+            "SELECT l.* FROM licenses l JOIN activations a ON a.license_id = l.id "
+            "WHERE a.activation_id = ?",
+            (aid,),
+        ).fetchone()
+    if row is None and machine_hash:
+        # Repli : ce poste est peut-être activé sous un autre identifiant.
+        row = con.execute(
+            "SELECT l.* FROM licenses l JOIN activations a ON a.license_id = l.id "
+            "WHERE a.machine_hash = ? AND a.status = 'active' "
+            "ORDER BY a.last_validated_at DESC LIMIT 1",
+            (str(machine_hash).strip(),),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Aucune licence activée pour ce poste (activation inconnue).",
+        )
+    return row
 
 
 class ActivationRequest(BaseModel):
@@ -602,7 +660,14 @@ def validate(payload: ValidationRequest) -> dict[str, Any]:
     now = _utc_now()
 
     with _db() as con:
-        license_row = _get_license_row(con, license_key)
+        # Clé absente (cas normal : le client ne la stocke pas en clair) →
+        # on identifie la licence par l'activation de ce poste.
+        if license_key:
+            license_row = _get_license_row(con, license_key)
+        else:
+            license_row = _license_row_from_activation(
+                con, payload.activation_id, machine_hash)
+            license_key = _normalize_license_key(str(license_row["license_key"] or ""))
         status_error = _license_status_error(license_row)
         if status_error:
             _log_event(
