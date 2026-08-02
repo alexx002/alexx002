@@ -23,6 +23,52 @@ DEFAULT_API_TOKEN = "CHANGE_ME"
 ENV_API_TOKEN_NAME = "LICENSE_SERVER_API_TOKEN"
 DEFAULT_MAX_DEVICES = 2
 DEFAULT_LICENSE_DURATION_DAYS = 365
+
+# ── Plans, du plus bas au plus haut ─────────────────────────────────────────
+# ⚠️ DOIT RESTER SYNCHRONISÉ avec EVENT_manager/core/entitlements.py
+#    (PLAN_ORDER et _ALIASES). Le logiciel client décide de ce que chaque plan
+#    débloque ; le serveur, lui, n'a besoin que de l'ORDRE, pour interdire les
+#    rétrogradations et savoir si l'on part d'une démo.
+PLAN_ORDER = ["demo", "basic", "pro", "expert"]
+PLAN_ALIASES = {
+    "demo": "demo", "démo": "demo", "trial": "demo", "essai": "demo", "test": "demo",
+    "basic": "basic", "base": "basic", "standard": "basic",
+    "pro": "pro", "professionnel": "pro", "premium": "pro", "plus": "pro",
+    "expert": "expert", "entreprise": "expert", "ultimate": "expert",
+}
+
+
+def normalize_plan(value: str | None) -> str:
+    """Ramène un libellé de plan à sa forme canonique. `plan_name` est du
+    texte libre en base (« Pro » par défaut) : sans normalisation, comparer
+    des rangs serait faux dès qu'un libellé diffère d'une majuscule."""
+    p = str(value or "").strip().lower()
+    p = PLAN_ALIASES.get(p, p)
+    return p if p in PLAN_ORDER else "demo"
+
+
+# Tarifs annuels par plan, en euros. Servent UNIQUEMENT à proposer un montant
+# au prorata lors d'une mise à niveau — le serveur n'encaisse rien. Modifiables
+# sans redéploiement via data/license_server_settings.json (clé "plan_prices").
+DEFAULT_PLAN_PRICES = {"demo": 0.0, "basic": 29.0, "pro": 49.0, "expert": 79.0}
+
+
+def plan_price(plan: str | None) -> float:
+    prices = SETTINGS.get("plan_prices") or {}
+    if not isinstance(prices, dict):
+        prices = {}
+    key = normalize_plan(plan)
+    try:
+        return float(prices.get(key, DEFAULT_PLAN_PRICES.get(key, 0.0)))
+    except Exception:
+        return float(DEFAULT_PLAN_PRICES.get(key, 0.0))
+
+
+def plan_rank(value: str | None) -> int:
+    try:
+        return PLAN_ORDER.index(normalize_plan(value))
+    except Exception:
+        return 0
 DEFAULT_OFFLINE_GRACE_DAYS = 7
 
 
@@ -89,6 +135,7 @@ def _load_settings() -> dict[str, Any]:
         "api_token": DEFAULT_API_TOKEN,
         "product_code": DEFAULT_PRODUCT_CODE,
         "default_max_devices": DEFAULT_MAX_DEVICES,
+        "plan_prices": dict(DEFAULT_PLAN_PRICES),
         "default_license_duration_days": DEFAULT_LICENSE_DURATION_DAYS,
         "default_offline_grace_days": DEFAULT_OFFLINE_GRACE_DAYS,
     }
@@ -151,6 +198,25 @@ def _ensure_schema() -> None:
                 last_ip TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY(license_id) REFERENCES licenses(id) ON DELETE CASCADE,
                 UNIQUE(license_id, machine_hash)
+            )
+            """
+        )
+        # Historique des mises à niveau : utile en comptabilité et en cas de
+        # contestation (quand, de quel plan vers quel plan, combien de jours
+        # restaient, et quel montant a été facturé au prorata).
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS plan_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                license_key TEXT NOT NULL,
+                old_plan TEXT NOT NULL,
+                new_plan TEXT NOT NULL,
+                days_remaining INTEGER NOT NULL DEFAULT 0,
+                expires_at_before TEXT NOT NULL DEFAULT '',
+                expires_at_after TEXT NOT NULL DEFAULT '',
+                amount_charged TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
             )
             """
         )
@@ -370,6 +436,17 @@ class CreateLicenseRequest(BaseModel):
 class UpdateLicenseStatusRequest(BaseModel):
     status: str
     notes: str = Field(default="")
+
+
+class UpgradePlanRequest(BaseModel):
+    """Mise à niveau d'une licence existante vers un plan SUPÉRIEUR."""
+    plan_name: str
+    # Montant réellement encaissé (au prorata), pour l'historique. Texte libre :
+    # le serveur ne fait pas de comptabilité, il conserve la trace.
+    amount_charged: str = Field(default="")
+    notes: str = Field(default="")
+    # Durée appliquée UNIQUEMENT lors d'une sortie de démo (voir endpoint).
+    duration_days: int = Field(default=DEFAULT_LICENSE_DURATION_DAYS, ge=1, le=3650)
 
 
 _ensure_schema()
@@ -785,6 +862,155 @@ def update_license_status(
             next_check_at=now + timedelta(days=int(updated["offline_grace_days"] or DEFAULT_OFFLINE_GRACE_DAYS)),
             message="Statut mis à jour.",
         )
+
+
+@app.patch("/admin/licenses/{license_key}/plan")
+def upgrade_license_plan(
+    license_key: str,
+    payload: UpgradePlanRequest,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Mise à niveau d'une licence EXISTANTE vers un plan supérieur.
+
+    Règle centrale : la date d'expiration n'est PAS réinitialisée. Sans cet
+    endpoint, faire passer un client de Pro à Expert imposait de créer une
+    nouvelle licence — donc de lui offrir une année entière à partir du jour
+    de la mise à niveau. Un client passant à Expert au bout de six mois
+    repartait pour douze.
+
+    Deux exceptions et une interdiction :
+      • Sortie de DÉMO : la démo n'est pas une période payée. Passer de démo à
+        un plan payant démarre bien une nouvelle période (expires_at recalculé).
+      • Entre deux plans PAYANTS : expires_at strictement conservé.
+      • RÉTROGRADATION INTERDITE : sinon un client souscrit Expert, exploite
+        tout en quelques jours, puis redescend en réclamant un remboursement.
+        Le nombre d'appareils n'est pas modifié non plus — cela relève d'une
+        demande de licence distincte.
+    """
+    _require_api_token(x_api_token)
+
+    new_plan = normalize_plan(payload.plan_name)
+    if str(payload.plan_name or "").strip().lower() not in PLAN_ALIASES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan inconnu : « {payload.plan_name} ». Attendu : {', '.join(PLAN_ORDER)}.",
+        )
+
+    now = _utc_now()
+    with _db() as con:
+        row = _get_license_row(con, license_key)
+        old_plan = normalize_plan(row["plan_name"])
+
+        if plan_rank(new_plan) < plan_rank(old_plan):
+            raise HTTPException(
+                status_code=409,
+                detail=(f"Rétrogradation refusée : la licence est en « {old_plan} », "
+                        f"passage en « {new_plan} » impossible."),
+            )
+        if plan_rank(new_plan) == plan_rank(old_plan):
+            raise HTTPException(
+                status_code=409,
+                detail=f"La licence est déjà en « {old_plan} ».",
+            )
+
+        expires_before = _parse_iso(row["expires_at"])
+        days_remaining = 0
+        if expires_before is not None:
+            days_remaining = max(0, (expires_before - now).days)
+
+        if old_plan == "demo":
+            # Sortie de démo : vraie période payée qui démarre aujourd'hui.
+            expires_after = now + timedelta(days=int(payload.duration_days))
+        else:
+            # Plan payant → plan payant : la date ne bouge pas. C'est l'objet
+            # même de cet endpoint.
+            expires_after = expires_before
+
+        # Montant SUGGÉRÉ au prorata du temps restant. Purement indicatif :
+        # c'est l'administrateur qui facture et encaisse.
+        created = _parse_iso(row["created_at"])
+        total_days = None
+        if created is not None and expires_before is not None:
+            total_days = max(1, (expires_before - created).days)
+        if not total_days:
+            total_days = DEFAULT_LICENSE_DURATION_DAYS
+        diff = max(0.0, plan_price(new_plan) - plan_price(old_plan))
+        if old_plan == "demo":
+            suggested = plan_price(new_plan)       # plein tarif : nouvelle période
+        else:
+            suggested = round(diff * days_remaining / total_days, 2)
+
+        con.execute(
+            "UPDATE licenses SET plan_name=?, expires_at=?, updated_at=? WHERE id=?",
+            (new_plan, _iso(expires_after) if expires_after else "", _iso(now), int(row["id"])),
+        )
+        con.execute(
+            """
+            INSERT INTO plan_changes(license_key, old_plan, new_plan, days_remaining,
+                                     expires_at_before, expires_at_after,
+                                     amount_charged, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _normalize_license_key(license_key), old_plan, new_plan, int(days_remaining),
+                _iso(expires_before) if expires_before else "",
+                _iso(expires_after) if expires_after else "",
+                str(payload.amount_charged or "").strip(),
+                str(payload.notes or "").strip(),
+                _iso(now),
+            ),
+        )
+        _log_event(
+            "admin_upgrade_plan",
+            license_key=_normalize_license_key(license_key),
+            details={
+                "old_plan": old_plan, "new_plan": new_plan,
+                "days_remaining": days_remaining,
+                "expiry_reset": bool(old_plan == "demo"),
+                "suggested_amount": suggested,
+                "amount_charged": str(payload.amount_charged or "").strip(),
+            },
+            con=con,
+        )
+
+        updated = _get_license_row(con, license_key)
+        used_devices = _count_active_activations(con, int(updated["id"]))
+        result = _row_to_license_payload(
+            updated,
+            used_devices=used_devices,
+            validated_at=now,
+            next_check_at=now + timedelta(days=int(updated["offline_grace_days"] or DEFAULT_OFFLINE_GRACE_DAYS)),
+            message=f"Licence mise à niveau : {old_plan} → {new_plan}.",
+        )
+        # Informations de facturation, à l'usage de l'outil d'administration.
+        result["upgrade"] = {
+            "old_plan": old_plan,
+            "new_plan": new_plan,
+            "days_remaining": days_remaining,
+            "total_days": total_days,
+            "price_old": plan_price(old_plan),
+            "price_new": plan_price(new_plan),
+            "suggested_amount": suggested,
+            "expiry_reset": bool(old_plan == "demo"),
+        }
+        return result
+
+
+@app.get("/admin/licenses/{license_key}/plan-changes")
+def list_plan_changes(license_key: str, x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
+    """Historique des mises à niveau d'une licence (comptabilité, litiges)."""
+    _require_api_token(x_api_token)
+    with _db() as con:
+        _get_license_row(con, license_key)   # 404 si la licence n'existe pas
+        rows = con.execute(
+            """
+            SELECT old_plan, new_plan, days_remaining, expires_at_before,
+                   expires_at_after, amount_charged, notes, created_at
+            FROM plan_changes WHERE license_key=? ORDER BY id DESC
+            """,
+            (_normalize_license_key(license_key),),
+        ).fetchall()
+        return {"ok": True, "items": [dict(r) for r in rows]}
 
 
 @app.get("/admin/licenses/{license_key}/activations")
