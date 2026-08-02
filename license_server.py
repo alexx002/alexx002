@@ -864,6 +864,99 @@ def update_license_status(
         )
 
 
+def _check_upgrade_allowed(old_plan: str, new_plan: str) -> None:
+    """Règles communes au devis et à l'application. Aucune rétrogradation :
+    sans cette barrière, un client souscrirait Expert, exploiterait tout en
+    quelques jours puis redescendrait en réclamant un remboursement."""
+    if plan_rank(new_plan) < plan_rank(old_plan):
+        raise HTTPException(
+            status_code=409,
+            detail=(f"Rétrogradation refusée : la licence est en « {old_plan} », "
+                    f"passage en « {new_plan} » impossible."),
+        )
+    if plan_rank(new_plan) == plan_rank(old_plan):
+        raise HTTPException(status_code=409, detail=f"La licence est déjà en « {old_plan} ».")
+
+
+def _compute_upgrade(row: sqlite3.Row, new_plan: str, duration_days: int,
+                     now: datetime) -> dict[str, Any]:
+    """Calcule le montant au prorata et la date d'expiration résultante,
+    SANS RIEN MODIFIER. Utilisé tel quel par le devis (lecture seule) et par
+    l'application, pour que le montant annoncé avant paiement soit exactement
+    celui appliqué ensuite."""
+    old_plan = normalize_plan(row["plan_name"])
+    expires_before = _parse_iso(row["expires_at"])
+    days_remaining = max(0, (expires_before - now).days) if expires_before else 0
+
+    if old_plan == "demo":
+        # Sortie de démo : la démo n'est pas une période payée, une vraie
+        # période démarre aujourd'hui.
+        expires_after = now + timedelta(days=int(duration_days))
+    else:
+        # Plan payant → plan payant supérieur : la date ne bouge pas. C'est
+        # tout l'objet de la mise à niveau.
+        expires_after = expires_before
+
+    created = _parse_iso(row["created_at"])
+    total_days = None
+    if created is not None and expires_before is not None:
+        total_days = max(1, (expires_before - created).days)
+    if not total_days:
+        total_days = DEFAULT_LICENSE_DURATION_DAYS
+
+    if old_plan == "demo":
+        suggested = plan_price(new_plan)          # plein tarif
+    else:
+        diff = max(0.0, plan_price(new_plan) - plan_price(old_plan))
+        suggested = round(diff * days_remaining / total_days, 2)
+
+    return {
+        "old_plan": old_plan,
+        "new_plan": new_plan,
+        "days_remaining": days_remaining,
+        "total_days": total_days,
+        "price_old": plan_price(old_plan),
+        "price_new": plan_price(new_plan),
+        "price_difference": round(plan_price(new_plan) - plan_price(old_plan), 2),
+        "suggested_amount": suggested,
+        "expiry_reset": bool(old_plan == "demo"),
+        "expires_at_before": _iso(expires_before) if expires_before else "",
+        "expires_at_after": _iso(expires_after) if expires_after else "",
+        "_expires_before": expires_before,
+        "_expires_after": expires_after,
+    }
+
+
+@app.get("/admin/licenses/{license_key}/upgrade-quote")
+def upgrade_quote(
+    license_key: str,
+    plan_name: str,
+    duration_days: int = DEFAULT_LICENSE_DURATION_DAYS,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """DEVIS : montant à facturer pour une mise à niveau, **sans rien changer**.
+
+    Permet d'annoncer le prix, d'encaisser, PUIS seulement d'appliquer le
+    changement. Les mêmes règles qu'à l'application sont vérifiées ici, pour
+    qu'un devis affiché ne puisse pas être refusé au moment de valider.
+    """
+    _require_api_token(x_api_token)
+    if str(plan_name or "").strip().lower() not in PLAN_ALIASES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan inconnu : « {plan_name} ». Attendu : {', '.join(PLAN_ORDER)}.",
+        )
+    new_plan = normalize_plan(plan_name)
+    with _db() as con:
+        row = _get_license_row(con, license_key)
+        _check_upgrade_allowed(normalize_plan(row["plan_name"]), new_plan)
+        calc = _compute_upgrade(row, new_plan, int(duration_days), _utc_now())
+        quote = {k: v for k, v in calc.items() if not k.startswith("_")}
+        quote["license_key"] = _normalize_license_key(license_key)
+        quote["customer_name"] = str(row["customer_name"] or "")
+        return {"ok": True, "quote": quote}
+
+
 @app.patch("/admin/licenses/{license_key}/plan")
 def upgrade_license_plan(
     license_key: str,
@@ -901,44 +994,14 @@ def upgrade_license_plan(
         row = _get_license_row(con, license_key)
         old_plan = normalize_plan(row["plan_name"])
 
-        if plan_rank(new_plan) < plan_rank(old_plan):
-            raise HTTPException(
-                status_code=409,
-                detail=(f"Rétrogradation refusée : la licence est en « {old_plan} », "
-                        f"passage en « {new_plan} » impossible."),
-            )
-        if plan_rank(new_plan) == plan_rank(old_plan):
-            raise HTTPException(
-                status_code=409,
-                detail=f"La licence est déjà en « {old_plan} ».",
-            )
+        _check_upgrade_allowed(old_plan, new_plan)
 
-        expires_before = _parse_iso(row["expires_at"])
-        days_remaining = 0
-        if expires_before is not None:
-            days_remaining = max(0, (expires_before - now).days)
-
-        if old_plan == "demo":
-            # Sortie de démo : vraie période payée qui démarre aujourd'hui.
-            expires_after = now + timedelta(days=int(payload.duration_days))
-        else:
-            # Plan payant → plan payant : la date ne bouge pas. C'est l'objet
-            # même de cet endpoint.
-            expires_after = expires_before
-
-        # Montant SUGGÉRÉ au prorata du temps restant. Purement indicatif :
-        # c'est l'administrateur qui facture et encaisse.
-        created = _parse_iso(row["created_at"])
-        total_days = None
-        if created is not None and expires_before is not None:
-            total_days = max(1, (expires_before - created).days)
-        if not total_days:
-            total_days = DEFAULT_LICENSE_DURATION_DAYS
-        diff = max(0.0, plan_price(new_plan) - plan_price(old_plan))
-        if old_plan == "demo":
-            suggested = plan_price(new_plan)       # plein tarif : nouvelle période
-        else:
-            suggested = round(diff * days_remaining / total_days, 2)
+        calc = _compute_upgrade(row, new_plan, int(payload.duration_days), now)
+        expires_before = calc["_expires_before"]
+        expires_after = calc["_expires_after"]
+        days_remaining = calc["days_remaining"]
+        total_days = calc["total_days"]
+        suggested = calc["suggested_amount"]
 
         con.execute(
             "UPDATE licenses SET plan_name=?, expires_at=?, updated_at=? WHERE id=?",
@@ -983,16 +1046,7 @@ def upgrade_license_plan(
             message=f"Licence mise à niveau : {old_plan} → {new_plan}.",
         )
         # Informations de facturation, à l'usage de l'outil d'administration.
-        result["upgrade"] = {
-            "old_plan": old_plan,
-            "new_plan": new_plan,
-            "days_remaining": days_remaining,
-            "total_days": total_days,
-            "price_old": plan_price(old_plan),
-            "price_new": plan_price(new_plan),
-            "suggested_amount": suggested,
-            "expiry_reset": bool(old_plan == "demo"),
-        }
+        result["upgrade"] = {k: v for k, v in calc.items() if not k.startswith("_")}
         return result
 
 
