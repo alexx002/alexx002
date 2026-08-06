@@ -1,6 +1,8 @@
+
+License server · PY
 # path: EVENT_manager/license_server.py
 from __future__ import annotations
-
+ 
 import hashlib
 import json
 import os
@@ -10,12 +12,12 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
-
+ 
 from fastapi import FastAPI, Form, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-
-
+ 
+ 
 APP_TITLE = "EventManagerPro License Server"
 DB_PATH = Path("data") / "license_server.db"
 SETTINGS_PATH = Path("data") / "license_server_settings.json"
@@ -24,7 +26,7 @@ DEFAULT_API_TOKEN = "CHANGE_ME"
 ENV_API_TOKEN_NAME = "LICENSE_SERVER_API_TOKEN"
 DEFAULT_MAX_DEVICES = 2
 DEFAULT_LICENSE_DURATION_DAYS = 365
-
+ 
 # ── Plans, du plus bas au plus haut ─────────────────────────────────────────
 # ⚠️ DOIT RESTER SYNCHRONISÉ avec EVENT_manager/core/entitlements.py
 #    (PLAN_ORDER et _ALIASES). Le logiciel client décide de ce que chaque plan
@@ -37,8 +39,8 @@ PLAN_ALIASES = {
     "pro": "pro", "professionnel": "pro", "premium": "pro", "plus": "pro",
     "expert": "expert", "entreprise": "expert", "ultimate": "expert",
 }
-
-
+ 
+ 
 def normalize_plan(value: str | None) -> str:
     """Ramène un libellé de plan à sa forme canonique. `plan_name` est du
     texte libre en base (« Pro » par défaut) : sans normalisation, comparer
@@ -46,14 +48,14 @@ def normalize_plan(value: str | None) -> str:
     p = str(value or "").strip().lower()
     p = PLAN_ALIASES.get(p, p)
     return p if p in PLAN_ORDER else "demo"
-
-
+ 
+ 
 # Tarifs annuels par plan, en euros. Servent UNIQUEMENT à proposer un montant
 # au prorata lors d'une mise à niveau — le serveur n'encaisse rien. Modifiables
 # sans redéploiement via data/license_server_settings.json (clé "plan_prices").
 DEFAULT_PLAN_PRICES = {"demo": 0.0, "basic": 29.0, "pro": 49.0, "expert": 79.0}
-
-
+ 
+ 
 def plan_price(plan: str | None) -> float:
     prices = SETTINGS.get("plan_prices") or {}
     if not isinstance(prices, dict):
@@ -63,26 +65,26 @@ def plan_price(plan: str | None) -> float:
         return float(prices.get(key, DEFAULT_PLAN_PRICES.get(key, 0.0)))
     except Exception:
         return float(DEFAULT_PLAN_PRICES.get(key, 0.0))
-
-
+ 
+ 
 def plan_rank(value: str | None) -> int:
     try:
         return PLAN_ORDER.index(normalize_plan(value))
     except Exception:
         return 0
 DEFAULT_OFFLINE_GRACE_DAYS = 7
-
-
+ 
+ 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
-
-
+ 
+ 
 def _iso(dt: Optional[datetime]) -> str:
     if dt is None:
         return ""
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
-
-
+ 
+ 
 def _parse_iso(value: str | None) -> Optional[datetime]:
     if not value:
         return None
@@ -95,45 +97,45 @@ def _parse_iso(value: str | None) -> Optional[datetime]:
         return datetime.fromisoformat(txt)
     except Exception:
         return None
-
-
+ 
+ 
 def _normalize_license_key(value: str) -> str:
     return str(value or "").strip().upper()
-
-
+ 
+ 
 def _normalize_token(value: str | None) -> str:
     return str(value or "").strip()
-
-
+ 
+ 
 def _machine_fingerprint(machine_id: str) -> str:
     raw = str(machine_id or "").strip().encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
-
-
+ 
+ 
 def _random_license_key() -> str:
     chunks = [secrets.token_hex(2).upper() for _ in range(4)]
     return "-".join(chunks)
-
-
+ 
+ 
 def _random_activation_id() -> str:
     return "ACT-" + secrets.token_hex(8).upper()
-
-
+ 
+ 
 def _random_relay_id() -> str:
     """Identifiant opaque de « boîte aux lettres » RSVP — jamais la clé de
     licence elle-même, pour ne rien exposer de sensible dans les liens
     envoyés aux invités (mêmes principes que activation_id)."""
     return "RLY-" + secrets.token_hex(8).upper()
-
-
+ 
+ 
 def _random_relay_secret() -> str:
     return secrets.token_urlsafe(32)
-
-
+ 
+ 
 def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-
-
+ 
+ 
 def _load_settings() -> dict[str, Any]:
     _ensure_parent(SETTINGS_PATH)
     if SETTINGS_PATH.exists():
@@ -153,11 +155,11 @@ def _load_settings() -> dict[str, Any]:
     }
     SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return data
-
-
+ 
+ 
 SETTINGS = _load_settings()
-
-
+ 
+ 
 @contextmanager
 def _db() -> sqlite3.Connection:
     _ensure_parent(DB_PATH)
@@ -168,8 +170,8 @@ def _db() -> sqlite3.Connection:
         con.commit()
     finally:
         con.close()
-
-
+ 
+ 
 def _ensure_schema() -> None:
     with _db() as con:
         con.execute(
@@ -277,8 +279,8 @@ def _ensure_schema() -> None:
             )
             """
         )
-
-
+ 
+ 
 def _seed_demo_license() -> None:
     now = _utc_now()
     with _db() as con:
@@ -308,8 +310,8 @@ def _seed_demo_license() -> None:
                 "Licence de démonstration créée automatiquement.",
             ),
         )
-
-
+ 
+ 
 def _log_event(
     event_type: str,
     *,
@@ -336,8 +338,8 @@ def _log_event(
         return
     with _db() as local_con:
         local_con.execute(sql, params)
-
-
+ 
+ 
 def _require_api_token(x_api_token: str | None) -> None:
     expected = _normalize_token(os.getenv(ENV_API_TOKEN_NAME)) or _normalize_token(SETTINGS.get("api_token"))
     got = _normalize_token(x_api_token)
@@ -348,8 +350,8 @@ def _require_api_token(x_api_token: str | None) -> None:
         )
     if not secrets.compare_digest(got, expected):
         raise HTTPException(status_code=401, detail="Token API invalide.")
-
-
+ 
+ 
 def _require_relay_installation(con: sqlite3.Connection, relay_id: str, x_relay_secret: str | None) -> sqlite3.Row:
     row = con.execute(
         "SELECT * FROM rsvp_installations WHERE relay_id=?",
@@ -360,8 +362,8 @@ def _require_relay_installation(con: sqlite3.Connection, relay_id: str, x_relay_
     if not secrets.compare_digest(_normalize_token(x_relay_secret), str(row["relay_secret"])):
         raise HTTPException(status_code=401, detail="Secret RSVP invalide.")
     return row
-
-
+ 
+ 
 def _row_to_license_payload(
     license_row: sqlite3.Row,
     *,
@@ -387,8 +389,8 @@ def _row_to_license_payload(
         "next_check_at": _iso(next_check_at),
         "offline_grace_days": int(license_row["offline_grace_days"] or 0),
     }
-
-
+ 
+ 
 def _license_status_error(license_row: sqlite3.Row) -> Optional[str]:
     status = str(license_row["status"] or "").strip().lower()
     if status not in {"active", "trial"}:
@@ -397,8 +399,8 @@ def _license_status_error(license_row: sqlite3.Row) -> Optional[str]:
     if expires_at is not None and expires_at < _utc_now():
         return "expired"
     return None
-
-
+ 
+ 
 def _key_compact(value: str) -> str:
     """Clé réduite à ses seuls caractères significatifs (sans tirets, espaces
     ni points), en majuscules."""
@@ -406,8 +408,8 @@ def _key_compact(value: str) -> str:
     for sep in ("-", " ", "\t", "."):
         txt = txt.replace(sep, "")
     return txt
-
-
+ 
+ 
 def _get_license_row(con: sqlite3.Connection, license_key: str) -> sqlite3.Row:
     row = con.execute(
         "SELECT * FROM licenses WHERE license_key=?",
@@ -429,16 +431,16 @@ def _get_license_row(con: sqlite3.Connection, license_key: str) -> sqlite3.Row:
     if row is None:
         raise HTTPException(status_code=404, detail="Licence introuvable.")
     return row
-
-
+ 
+ 
 def _count_active_activations(con: sqlite3.Connection, license_id: int) -> int:
     row = con.execute(
         "SELECT COUNT(*) AS n FROM activations WHERE license_id=? AND status='active'",
         (int(license_id),),
     ).fetchone()
     return int(row["n"] if row else 0)
-
-
+ 
+ 
 def _find_activation(
     con: sqlite3.Connection,
     *,
@@ -465,13 +467,13 @@ def _find_activation(
         ,
         (int(license_id), str(machine_hash).strip()),
     ).fetchone()
-
-
+ 
+ 
 def _license_row_from_activation(con: sqlite3.Connection, activation_id: str,
                                  machine_hash: str) -> sqlite3.Row:
     """Retrouve la licence à partir de l'ACTIVATION, quand la clé n'est pas
     transmise.
-
+ 
     Le logiciel client ne conserve JAMAIS la clé en clair sur le poste (par
     sécurité : seuls un masque et une empreinte sont stockés). Il valide donc
     avec son `activation_id`, la clé partant vide. Le serveur exigeait
@@ -501,8 +503,8 @@ def _license_row_from_activation(con: sqlite3.Connection, activation_id: str,
             detail="Aucune licence activée pour ce poste (activation inconnue).",
         )
     return row
-
-
+ 
+ 
 class ActivationRequest(BaseModel):
     product_code: str = Field(default=DEFAULT_PRODUCT_CODE)
     app_name: str = Field(default=DEFAULT_PRODUCT_CODE)
@@ -514,8 +516,8 @@ class ActivationRequest(BaseModel):
     platform_release: str = Field(default="")
     hostname: str = Field(default="")
     activation_id: str = Field(default="")
-
-
+ 
+ 
 class ValidationRequest(BaseModel):
     product_code: str = Field(default=DEFAULT_PRODUCT_CODE)
     app_name: str = Field(default=DEFAULT_PRODUCT_CODE)
@@ -527,15 +529,15 @@ class ValidationRequest(BaseModel):
     platform_release: str = Field(default="")
     hostname: str = Field(default="")
     activation_id: str = Field(default="")
-
-
+ 
+ 
 class DeactivationRequest(BaseModel):
     product_code: str = Field(default=DEFAULT_PRODUCT_CODE)
     license_key: str
     machine_id: str
     activation_id: str = Field(default="")
-
-
+ 
+ 
 class CreateLicenseRequest(BaseModel):
     customer_name: str = Field(default="")
     plan_name: str = Field(default="Pro")
@@ -545,13 +547,13 @@ class CreateLicenseRequest(BaseModel):
     notes: str = Field(default="")
     product_code: str = Field(default=DEFAULT_PRODUCT_CODE)
     license_key: str = Field(default="")
-
-
+ 
+ 
 class UpdateLicenseStatusRequest(BaseModel):
     status: str
     notes: str = Field(default="")
-
-
+ 
+ 
 class UpgradePlanRequest(BaseModel):
     """Mise à niveau d'une licence existante vers un plan SUPÉRIEUR."""
     plan_name: str
@@ -561,12 +563,12 @@ class UpgradePlanRequest(BaseModel):
     notes: str = Field(default="")
     # Durée appliquée UNIQUEMENT lors d'une sortie de démo (voir endpoint).
     duration_days: int = Field(default=DEFAULT_LICENSE_DURATION_DAYS, ge=1, le=3650)
-
-
+ 
+ 
 class RsvpRegisterRequest(BaseModel):
     """Un seul enregistrement par installation cliente, au premier besoin —
     le relay_id + relay_secret renvoyés sont ensuite conservés localement.
-
+ 
     S'authentifie par activation_id, PAS par license_key : le logiciel
     client ne conserve jamais la clé en clair sur le poste après activation
     (voir _license_row_from_activation). machine_id sert de repli si
@@ -574,21 +576,21 @@ class RsvpRegisterRequest(BaseModel):
     product_code: str = Field(default=DEFAULT_PRODUCT_CODE)
     activation_id: str = Field(default="")
     machine_id: str = Field(default="")
-
-
+ 
+ 
 class RsvpAnswerRequest(BaseModel):
     """Soumise par le NAVIGATEUR de l'invité — aucune donnée personnelle,
     juste sa réponse. Le serveur ne connaît ni son nom ni son e-mail."""
     answer: str
     comment: str = Field(default="")
-
-
+ 
+ 
 _ensure_schema()
 _seed_demo_license()
-
+ 
 app = FastAPI(title=APP_TITLE)
-
-
+ 
+ 
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
@@ -597,17 +599,17 @@ def health() -> dict[str, Any]:
         "product_code": str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE),
         "server_time": _iso(_utc_now()),
     }
-
-
+ 
+ 
 @app.post("/activate")
 def activate(payload: ActivationRequest) -> dict[str, Any]:
     if _normalize_license_key(payload.product_code) != _normalize_license_key(str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE)):
         raise HTTPException(status_code=400, detail="product_code invalide.")
-
+ 
     license_key = _normalize_license_key(payload.license_key)
     machine_hash = _machine_fingerprint(payload.machine_id)
     now = _utc_now()
-
+ 
     with _db() as con:
         license_row = _get_license_row(con, license_key)
         status_error = _license_status_error(license_row)
@@ -620,7 +622,7 @@ def activate(payload: ActivationRequest) -> dict[str, Any]:
                 con=con,
             )
             raise HTTPException(status_code=403, detail=f"Licence {status_error}.")
-
+ 
         existing = _find_activation(
             con,
             license_id=int(license_row["id"]),
@@ -665,7 +667,7 @@ def activate(payload: ActivationRequest) -> dict[str, Any]:
                 next_check_at=next_check_at,
                 message="Licence déjà activée sur ce poste.",
             )
-
+ 
         used_devices = _count_active_activations(con, int(license_row["id"]))
         max_devices = int(license_row["max_devices"] or 0)
         if used_devices >= max_devices:
@@ -677,7 +679,7 @@ def activate(payload: ActivationRequest) -> dict[str, Any]:
                 con=con,
             )
             raise HTTPException(status_code=403, detail="Nombre maximal d'appareils atteint.")
-
+ 
         activation_id = _random_activation_id()
         con.execute(
             """
@@ -724,17 +726,17 @@ def activate(payload: ActivationRequest) -> dict[str, Any]:
             next_check_at=next_check_at,
             message="Licence activée.",
         )
-
-
+ 
+ 
 @app.post("/validate")
 def validate(payload: ValidationRequest) -> dict[str, Any]:
     if _normalize_license_key(payload.product_code) != _normalize_license_key(str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE)):
         raise HTTPException(status_code=400, detail="product_code invalide.")
-
+ 
     license_key = _normalize_license_key(payload.license_key)
     machine_hash = _machine_fingerprint(payload.machine_id)
     now = _utc_now()
-
+ 
     with _db() as con:
         # Clé absente (cas normal : le client ne la stocke pas en clair) →
         # on identifie la licence par l'activation de ce poste.
@@ -754,7 +756,7 @@ def validate(payload: ValidationRequest) -> dict[str, Any]:
                 con=con,
             )
             raise HTTPException(status_code=403, detail=f"Licence {status_error}.")
-
+ 
         activation = _find_activation(
             con,
             license_id=int(license_row["id"]),
@@ -780,7 +782,7 @@ def validate(payload: ValidationRequest) -> dict[str, Any]:
                 con=con,
             )
             raise HTTPException(status_code=403, detail="Activation inactive.")
-
+ 
         con.execute(
             """
             UPDATE activations
@@ -822,17 +824,17 @@ def validate(payload: ValidationRequest) -> dict[str, Any]:
             next_check_at=next_check_at,
             message="Licence valide.",
         )
-
-
+ 
+ 
 @app.post("/deactivate")
 def deactivate(payload: DeactivationRequest) -> dict[str, Any]:
     if _normalize_license_key(payload.product_code) != _normalize_license_key(str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE)):
         raise HTTPException(status_code=400, detail="product_code invalide.")
-
+ 
     license_key = _normalize_license_key(payload.license_key)
     machine_hash = _machine_fingerprint(payload.machine_id)
     now = _utc_now()
-
+ 
     with _db() as con:
         license_row = _get_license_row(con, license_key)
         activation = _find_activation(
@@ -854,7 +856,7 @@ def deactivate(payload: DeactivationRequest) -> dict[str, Any]:
                 "message": "Aucune activation active à supprimer pour ce poste.",
                 "activation_id": str(payload.activation_id or ""),
             }
-
+ 
         con.execute(
             """
             UPDATE activations
@@ -884,15 +886,15 @@ def deactivate(payload: DeactivationRequest) -> dict[str, Any]:
             "used_devices": used_devices,
             "max_devices": int(license_row["max_devices"] or 0),
         }
-
-
+ 
+ 
 @app.post("/admin/licenses")
 def create_license(payload: CreateLicenseRequest, x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
     _require_api_token(x_api_token)
     now = _utc_now()
     license_key = _normalize_license_key(payload.license_key) or _random_license_key()
     expires_at = now + timedelta(days=int(payload.duration_days))
-
+ 
     with _db() as con:
         existing = con.execute(
             "SELECT 1 FROM licenses WHERE license_key=?",
@@ -930,8 +932,8 @@ def create_license(payload: CreateLicenseRequest, x_api_token: str | None = Head
             next_check_at=now + timedelta(days=int(row["offline_grace_days"] or DEFAULT_OFFLINE_GRACE_DAYS)),
             message="Licence créée.",
         )
-
-
+ 
+ 
 @app.get("/admin/licenses")
 def list_licenses(x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
     _require_api_token(x_api_token)
@@ -963,8 +965,8 @@ def list_licenses(x_api_token: str | None = Header(default=None)) -> dict[str, A
                 }
             )
         return {"ok": True, "items": items}
-
-
+ 
+ 
 @app.patch("/admin/licenses/{license_key}/status")
 def update_license_status(
     license_key: str,
@@ -975,7 +977,7 @@ def update_license_status(
     new_status = str(payload.status or "").strip().lower()
     if new_status not in {"active", "blocked", "revoked", "expired", "trial"}:
         raise HTTPException(status_code=400, detail="Statut invalide.")
-
+ 
     now = _utc_now()
     with _db() as con:
         row = _get_license_row(con, license_key)
@@ -1003,8 +1005,8 @@ def update_license_status(
             next_check_at=now + timedelta(days=int(updated["offline_grace_days"] or DEFAULT_OFFLINE_GRACE_DAYS)),
             message="Statut mis à jour.",
         )
-
-
+ 
+ 
 def _check_upgrade_allowed(old_plan: str, new_plan: str) -> None:
     """Règles communes au devis et à l'application. Aucune rétrogradation :
     sans cette barrière, un client souscrirait Expert, exploiterait tout en
@@ -1017,8 +1019,8 @@ def _check_upgrade_allowed(old_plan: str, new_plan: str) -> None:
         )
     if plan_rank(new_plan) == plan_rank(old_plan):
         raise HTTPException(status_code=409, detail=f"La licence est déjà en « {old_plan} ».")
-
-
+ 
+ 
 def _compute_upgrade(row: sqlite3.Row, new_plan: str, duration_days: int,
                      now: datetime) -> dict[str, Any]:
     """Calcule le montant au prorata et la date d'expiration résultante,
@@ -1028,7 +1030,7 @@ def _compute_upgrade(row: sqlite3.Row, new_plan: str, duration_days: int,
     old_plan = normalize_plan(row["plan_name"])
     expires_before = _parse_iso(row["expires_at"])
     days_remaining = max(0, (expires_before - now).days) if expires_before else 0
-
+ 
     if old_plan == "demo":
         # Sortie de démo : la démo n'est pas une période payée, une vraie
         # période démarre aujourd'hui.
@@ -1037,20 +1039,20 @@ def _compute_upgrade(row: sqlite3.Row, new_plan: str, duration_days: int,
         # Plan payant → plan payant supérieur : la date ne bouge pas. C'est
         # tout l'objet de la mise à niveau.
         expires_after = expires_before
-
+ 
     created = _parse_iso(row["created_at"])
     total_days = None
     if created is not None and expires_before is not None:
         total_days = max(1, (expires_before - created).days)
     if not total_days:
         total_days = DEFAULT_LICENSE_DURATION_DAYS
-
+ 
     if old_plan == "demo":
         suggested = plan_price(new_plan)          # plein tarif
     else:
         diff = max(0.0, plan_price(new_plan) - plan_price(old_plan))
         suggested = round(diff * days_remaining / total_days, 2)
-
+ 
     return {
         "old_plan": old_plan,
         "new_plan": new_plan,
@@ -1066,8 +1068,8 @@ def _compute_upgrade(row: sqlite3.Row, new_plan: str, duration_days: int,
         "_expires_before": expires_before,
         "_expires_after": expires_after,
     }
-
-
+ 
+ 
 @app.get("/admin/licenses/{license_key}/upgrade-quote")
 def upgrade_quote(
     license_key: str,
@@ -1076,7 +1078,7 @@ def upgrade_quote(
     x_api_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """DEVIS : montant à facturer pour une mise à niveau, **sans rien changer**.
-
+ 
     Permet d'annoncer le prix, d'encaisser, PUIS seulement d'appliquer le
     changement. Les mêmes règles qu'à l'application sont vérifiées ici, pour
     qu'un devis affiché ne puisse pas être refusé au moment de valider.
@@ -1096,8 +1098,8 @@ def upgrade_quote(
         quote["license_key"] = _normalize_license_key(license_key)
         quote["customer_name"] = str(row["customer_name"] or "")
         return {"ok": True, "quote": quote}
-
-
+ 
+ 
 @app.patch("/admin/licenses/{license_key}/plan")
 def upgrade_license_plan(
     license_key: str,
@@ -1105,13 +1107,13 @@ def upgrade_license_plan(
     x_api_token: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """Mise à niveau d'une licence EXISTANTE vers un plan supérieur.
-
+ 
     Règle centrale : la date d'expiration n'est PAS réinitialisée. Sans cet
     endpoint, faire passer un client de Pro à Expert imposait de créer une
     nouvelle licence — donc de lui offrir une année entière à partir du jour
     de la mise à niveau. Un client passant à Expert au bout de six mois
     repartait pour douze.
-
+ 
     Deux exceptions et une interdiction :
       • Sortie de DÉMO : la démo n'est pas une période payée. Passer de démo à
         un plan payant démarre bien une nouvelle période (expires_at recalculé).
@@ -1122,28 +1124,28 @@ def upgrade_license_plan(
         demande de licence distincte.
     """
     _require_api_token(x_api_token)
-
+ 
     new_plan = normalize_plan(payload.plan_name)
     if str(payload.plan_name or "").strip().lower() not in PLAN_ALIASES:
         raise HTTPException(
             status_code=400,
             detail=f"Plan inconnu : « {payload.plan_name} ». Attendu : {', '.join(PLAN_ORDER)}.",
         )
-
+ 
     now = _utc_now()
     with _db() as con:
         row = _get_license_row(con, license_key)
         old_plan = normalize_plan(row["plan_name"])
-
+ 
         _check_upgrade_allowed(old_plan, new_plan)
-
+ 
         calc = _compute_upgrade(row, new_plan, int(payload.duration_days), now)
         expires_before = calc["_expires_before"]
         expires_after = calc["_expires_after"]
         days_remaining = calc["days_remaining"]
         total_days = calc["total_days"]
         suggested = calc["suggested_amount"]
-
+ 
         con.execute(
             "UPDATE licenses SET plan_name=?, expires_at=?, updated_at=? WHERE id=?",
             (new_plan, _iso(expires_after) if expires_after else "", _iso(now), int(row["id"])),
@@ -1176,7 +1178,7 @@ def upgrade_license_plan(
             },
             con=con,
         )
-
+ 
         updated = _get_license_row(con, license_key)
         used_devices = _count_active_activations(con, int(updated["id"]))
         result = _row_to_license_payload(
@@ -1189,8 +1191,8 @@ def upgrade_license_plan(
         # Informations de facturation, à l'usage de l'outil d'administration.
         result["upgrade"] = {k: v for k, v in calc.items() if not k.startswith("_")}
         return result
-
-
+ 
+ 
 @app.get("/admin/licenses/{license_key}/plan-changes")
 def list_plan_changes(license_key: str, x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
     """Historique des mises à niveau d'une licence (comptabilité, litiges)."""
@@ -1206,8 +1208,8 @@ def list_plan_changes(license_key: str, x_api_token: str | None = Header(default
             (_normalize_license_key(license_key),),
         ).fetchall()
         return {"ok": True, "items": [dict(r) for r in rows]}
-
-
+ 
+ 
 @app.get("/admin/licenses/{license_key}/activations")
 def list_activations(license_key: str, x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
     _require_api_token(x_api_token)
@@ -1244,14 +1246,14 @@ def list_activations(license_key: str, x_api_token: str | None = Header(default=
                 for a in acts
             ],
         }
-
-
+ 
+ 
 @app.delete("/admin/licenses/{license_key}")
 def delete_license(license_key: str, x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
     _require_api_token(x_api_token)
     now = _utc_now()
     normalized_license_key = _normalize_license_key(license_key)
-
+ 
     with _db() as con:
         row = _get_license_row(con, normalized_license_key)
         activation_row = con.execute(
@@ -1259,14 +1261,14 @@ def delete_license(license_key: str, x_api_token: str | None = Header(default=No
             (int(row["id"]),),
         ).fetchone()
         deleted_activations = int(activation_row["n"] if activation_row else 0)
-
+ 
         _log_event(
             "admin_delete_license",
             license_key=normalized_license_key,
             details={"deleted_activations": deleted_activations},
             con=con,
         )
-
+ 
         con.execute(
             "DELETE FROM activations WHERE license_id=?",
             (int(row["id"]),),
@@ -1275,7 +1277,7 @@ def delete_license(license_key: str, x_api_token: str | None = Header(default=No
             "DELETE FROM licenses WHERE id=?",
             (int(row["id"]),),
         )
-
+ 
         return {
             "ok": True,
             "license_key": normalized_license_key,
@@ -1283,8 +1285,8 @@ def delete_license(license_key: str, x_api_token: str | None = Header(default=No
             "deleted_activations": deleted_activations,
             "deleted_at": _iso(now),
         }
-
-
+ 
+ 
 # ═══════════════════════════════════════════════════════════════════════════
 # Boîte aux lettres RSVP
 #
@@ -1300,10 +1302,10 @@ def delete_license(license_key: str, x_api_token: str | None = Header(default=No
 # réception explicite : GET renvoie ce qui est en attente SANS l'effacer,
 # pour ne rien perdre si le client plante avant d'avoir traité la réponse).
 # ═══════════════════════════════════════════════════════════════════════════
-
+ 
 _RSVP_ANSWER_LABELS = {"oui": "Présent(e)", "non": "Absent(e)", "peut-être": "Incertain(e)"}
-
-
+ 
+ 
 def _rsvp_html_page(title: str, body: str) -> str:
     return f"""<!DOCTYPE html>
 <html lang="fr"><head><meta charset="utf-8">
@@ -1327,8 +1329,8 @@ def _rsvp_html_page(title: str, body: str) -> str:
   p.hint {{ color:#8b95ab; font-size:13px; }}
 </style></head>
 <body><div class="card">{body}</div></body></html>"""
-
-
+ 
+ 
 def _rsvp_form_page(relay_id: str, token: str, current_answer: str = "", current_comment: str = "") -> str:
     options = ""
     for value, label in (("oui", "Présent(e)"), ("non", "Absent(e)"), ("peut-être", "Incertain(e)")):
@@ -1352,8 +1354,8 @@ def _rsvp_form_page(relay_id: str, token: str, current_answer: str = "", current
       <p class="hint">Votre réponse sera prise en compte dès que l'organisateur sera reconnecté.</p>
     """
     return _rsvp_html_page("Confirmez votre présence", body)
-
-
+ 
+ 
 def _rsvp_confirm_page(answer: str) -> str:
     label = _RSVP_ANSWER_LABELS.get(answer, answer)
     body = f"""
@@ -1363,27 +1365,27 @@ def _rsvp_confirm_page(answer: str) -> str:
       vous pouvez revenir sur ce lien à tout moment pour la modifier.</p>
     """
     return _rsvp_html_page("Merci", body)
-
-
+ 
+ 
 def _rsvp_invalid_page(message: str) -> str:
     return _rsvp_html_page("Lien invalide", f"<h1>Lien invalide</h1><p>{message}</p>")
-
-
+ 
+ 
 @app.post("/rsvp/register")
 def rsvp_register(payload: RsvpRegisterRequest) -> dict[str, Any]:
     if _normalize_license_key(payload.product_code) != _normalize_license_key(str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE)):
         raise HTTPException(status_code=400, detail="product_code invalide.")
-
+ 
     machine_hash = _machine_fingerprint(payload.machine_id) if payload.machine_id else ""
     now = _utc_now()
-
+ 
     with _db() as con:
         license_row = _license_row_from_activation(con, payload.activation_id, machine_hash)
         license_key = str(license_row["license_key"])
         status_error = _license_status_error(license_row)
         if status_error:
             raise HTTPException(status_code=403, detail=f"Licence {status_error}.")
-
+ 
         relay_id = _random_relay_id()
         relay_secret = _random_relay_secret()
         con.execute(
@@ -1402,12 +1404,12 @@ def rsvp_register(payload: RsvpRegisterRequest) -> dict[str, Any]:
             con=con,
         )
         return {"ok": True, "relay_id": relay_id, "relay_secret": relay_secret}
-
-
+ 
+ 
 class RsvpAckRequest(BaseModel):
     tokens: list[str] = Field(default_factory=list)
-
-
+ 
+ 
 # Routes /rsvp/sync/... déclarées AVANT /rsvp/{relay_id}/{token} : FastAPI
 # fait correspondre les routes dans l'ordre de déclaration, et {relay_id}/{token}
 # capturerait sinon "sync"/"<relay_id>" comme s'il s'agissait d'un jeton invité.
@@ -1436,8 +1438,8 @@ def rsvp_sync(relay_id: str, x_relay_secret: str | None = Header(default=None)) 
                 for r in rows
             ],
         }
-
-
+ 
+ 
 @app.post("/rsvp/sync/{relay_id}/ack")
 def rsvp_sync_ack(relay_id: str, payload: RsvpAckRequest, x_relay_secret: str | None = Header(default=None)) -> dict[str, Any]:
     with _db() as con:
@@ -1451,8 +1453,8 @@ def rsvp_sync_ack(relay_id: str, payload: RsvpAckRequest, x_relay_secret: str | 
             )
             deleted += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
         return {"ok": True, "deleted": deleted}
-
-
+ 
+ 
 # Chemin /{relay_id}/rsvp (jeton en paramètre de requête ?t=...), et non
 # /rsvp/{relay_id}/{token} : voir le commentaire dans _rsvp_form_page.
 @app.get("/{relay_id}/rsvp", response_class=HTMLResponse)
@@ -1473,8 +1475,8 @@ def rsvp_form(relay_id: str, t: str = "") -> HTMLResponse:
         current_answer = str(existing["answer"]) if existing else ""
         current_comment = str(existing["comment"]) if existing else ""
     return HTMLResponse(_rsvp_form_page(relay_id, token, current_answer, current_comment))
-
-
+ 
+ 
 @app.post("/{relay_id}/rsvp", response_class=HTMLResponse)
 def rsvp_submit(relay_id: str, t: str = "", answer: str = Form(...), comment: str = Form(default="")) -> HTMLResponse:
     token = str(t or "").strip()
@@ -1483,7 +1485,7 @@ def rsvp_submit(relay_id: str, t: str = "", answer: str = Form(...), comment: st
         return HTMLResponse(_rsvp_invalid_page("Réponse non reconnue."), status_code=400)
     comment = str(comment or "").strip()[:500]
     now = _utc_now()
-
+ 
     with _db() as con:
         installation = con.execute(
             "SELECT 1 FROM rsvp_installations WHERE relay_id=?", (str(relay_id or "").strip(),)
@@ -1503,14 +1505,17 @@ def rsvp_submit(relay_id: str, t: str = "", answer: str = Form(...), comment: st
         )
         _log_event("rsvp_answer_received", details={"relay_id": relay_id, "answer": answer}, con=con)
     return HTMLResponse(_rsvp_confirm_page(answer))
-
-
+ 
+ 
 if __name__ == "__main__":
     import uvicorn
-
+ 
     uvicorn.run(
         "license_server:app",
         host="0.0.0.0",
         port=8010,
         reload=False,
     )
+ 
+
+
