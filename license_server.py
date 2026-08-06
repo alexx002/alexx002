@@ -11,7 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Form, Header, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 
@@ -116,6 +117,17 @@ def _random_license_key() -> str:
 
 def _random_activation_id() -> str:
     return "ACT-" + secrets.token_hex(8).upper()
+
+
+def _random_relay_id() -> str:
+    """Identifiant opaque de « boîte aux lettres » RSVP — jamais la clé de
+    licence elle-même, pour ne rien exposer de sensible dans les liens
+    envoyés aux invités (mêmes principes que activation_id)."""
+    return "RLY-" + secrets.token_hex(8).upper()
+
+
+def _random_relay_secret() -> str:
+    return secrets.token_urlsafe(32)
 
 
 def _ensure_parent(path: Path) -> None:
@@ -233,6 +245,38 @@ def _ensure_schema() -> None:
             )
             """
         )
+        # ── Boîte aux lettres RSVP ──────────────────────────────────────────
+        # Permet aux invités de répondre même quand le PC du client (qui sert
+        # normalement /rsvp en Wi-Fi local ou via tunnel ngrok) est éteint. Le
+        # serveur ne connaît jamais les invités eux-mêmes : seulement un
+        # identifiant d'installation opaque (relay_id, jamais la clé de
+        # licence) et le jeton RSVP par invité déjà généré côté client.
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rsvp_installations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relay_id TEXT NOT NULL UNIQUE,
+                relay_secret TEXT NOT NULL,
+                license_key TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                last_sync_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rsvp_pending (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relay_id TEXT NOT NULL,
+                guest_token TEXT NOT NULL,
+                answer TEXT NOT NULL DEFAULT '',
+                comment TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(relay_id, guest_token)
+            )
+            """
+        )
 
 
 def _seed_demo_license() -> None:
@@ -304,6 +348,18 @@ def _require_api_token(x_api_token: str | None) -> None:
         )
     if not secrets.compare_digest(got, expected):
         raise HTTPException(status_code=401, detail="Token API invalide.")
+
+
+def _require_relay_installation(con: sqlite3.Connection, relay_id: str, x_relay_secret: str | None) -> sqlite3.Row:
+    row = con.execute(
+        "SELECT * FROM rsvp_installations WHERE relay_id=?",
+        (str(relay_id or "").strip(),),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Installation RSVP inconnue.")
+    if not secrets.compare_digest(_normalize_token(x_relay_secret), str(row["relay_secret"])):
+        raise HTTPException(status_code=401, detail="Secret RSVP invalide.")
+    return row
 
 
 def _row_to_license_payload(
@@ -505,6 +561,26 @@ class UpgradePlanRequest(BaseModel):
     notes: str = Field(default="")
     # Durée appliquée UNIQUEMENT lors d'une sortie de démo (voir endpoint).
     duration_days: int = Field(default=DEFAULT_LICENSE_DURATION_DAYS, ge=1, le=3650)
+
+
+class RsvpRegisterRequest(BaseModel):
+    """Un seul enregistrement par installation cliente, au premier besoin —
+    le relay_id + relay_secret renvoyés sont ensuite conservés localement.
+
+    S'authentifie par activation_id, PAS par license_key : le logiciel
+    client ne conserve jamais la clé en clair sur le poste après activation
+    (voir _license_row_from_activation). machine_id sert de repli si
+    l'activation_id fourni ne correspond à rien (même logique que /validate)."""
+    product_code: str = Field(default=DEFAULT_PRODUCT_CODE)
+    activation_id: str = Field(default="")
+    machine_id: str = Field(default="")
+
+
+class RsvpAnswerRequest(BaseModel):
+    """Soumise par le NAVIGATEUR de l'invité — aucune donnée personnelle,
+    juste sa réponse. Le serveur ne connaît ni son nom ni son e-mail."""
+    answer: str
+    comment: str = Field(default="")
 
 
 _ensure_schema()
@@ -1207,6 +1283,226 @@ def delete_license(license_key: str, x_api_token: str | None = Header(default=No
             "deleted_activations": deleted_activations,
             "deleted_at": _iso(now),
         }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Boîte aux lettres RSVP
+#
+# Objectif : un invité peut répondre même quand le PC du client est éteint
+# (jusqu'ici, /rsvp n'était servi que par le PC du client lui-même, en Wi-Fi
+# local ou via un tunnel ngrok qu'il faut laisser actif). Ce service ne
+# remplace pas ça — il donne un filet toujours disponible.
+#
+# Confidentialité : ce serveur ne connaît JAMAIS l'invité (ni son nom, ni son
+# e-mail). Seul le jeton RSVP par invité — déjà généré côté client, déjà
+# imprévisible — transite ici, avec sa réponse. Le logiciel du client vient
+# récupérer les réponses en attente puis les efface d'ici (accusé de
+# réception explicite : GET renvoie ce qui est en attente SANS l'effacer,
+# pour ne rien perdre si le client plante avant d'avoir traité la réponse).
+# ═══════════════════════════════════════════════════════════════════════════
+
+_RSVP_ANSWER_LABELS = {"oui": "Présent(e)", "non": "Absent(e)", "peut-être": "Incertain(e)"}
+
+
+def _rsvp_html_page(title: str, body: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif; background:#0b1224; color:#f4f7fb;
+         display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:20px; }}
+  .card {{ background:#131b2e; border:1px solid #2a3550; border-radius:14px; padding:28px 24px; max-width:420px; width:100%; }}
+  h1 {{ font-size:20px; margin:0 0 16px; }}
+  label {{ display:block; margin:14px 0 6px; font-size:14px; color:#c7d0e0; }}
+  .choix {{ display:flex; gap:8px; flex-wrap:wrap; }}
+  .choix label {{ background:#1b2440; border:1px solid #2a3550; border-radius:8px; padding:10px 14px;
+                  cursor:pointer; margin:0; font-size:14px; flex:1; text-align:center; }}
+  .choix input {{ display:none; }}
+  .choix input:checked + span {{ font-weight:700; }}
+  textarea {{ width:100%; box-sizing:border-box; background:#0b1224; color:#f4f7fb; border:1px solid #2a3550;
+              border-radius:8px; padding:10px; font-family:inherit; font-size:14px; min-height:70px; }}
+  button {{ margin-top:18px; width:100%; padding:12px; background:#2563eb; color:#fff; border:none;
+            border-radius:8px; font-size:15px; cursor:pointer; }}
+  p.hint {{ color:#8b95ab; font-size:13px; }}
+</style></head>
+<body><div class="card">{body}</div></body></html>"""
+
+
+def _rsvp_form_page(relay_id: str, token: str, current_answer: str = "", current_comment: str = "") -> str:
+    options = ""
+    for value, label in (("oui", "Présent(e)"), ("non", "Absent(e)"), ("peut-être", "Incertain(e)")):
+        checked = "checked" if value == current_answer else ""
+        options += f'<label><input type="radio" name="answer" value="{value}" {checked} required><span>{label}</span></label>'
+    # Le jeton reste en paramètre de requête (?t=...), pas en segment de
+    # chemin : ça permet à /{relay_id}/rsvp de correspondre exactement au
+    # format déjà utilisé par le logiciel client pour ses propres liens
+    # RSVP (core/mailmerge.py : f"{base}/rsvp?t={token}"), sans rien avoir
+    # à changer côté appelant.
+    from urllib.parse import quote
+    action = f"/{quote(str(relay_id), safe='')}/rsvp?t={quote(str(token), safe='')}"
+    body = f"""
+      <h1>Confirmez votre présence</h1>
+      <form method="post" action="{action}">
+        <div class="choix">{options}</div>
+        <label for="comment">Un mot pour l'organisateur (facultatif)</label>
+        <textarea id="comment" name="comment">{current_comment}</textarea>
+        <button type="submit">Envoyer ma réponse</button>
+      </form>
+      <p class="hint">Votre réponse sera prise en compte dès que l'organisateur sera reconnecté.</p>
+    """
+    return _rsvp_html_page("Confirmez votre présence", body)
+
+
+def _rsvp_confirm_page(answer: str) -> str:
+    label = _RSVP_ANSWER_LABELS.get(answer, answer)
+    body = f"""
+      <h1>Merci !</h1>
+      <p>Votre réponse (« {label} ») a bien été enregistrée.</p>
+      <p class="hint">Elle sera prise en compte dès que l'organisateur sera reconnecté —
+      vous pouvez revenir sur ce lien à tout moment pour la modifier.</p>
+    """
+    return _rsvp_html_page("Merci", body)
+
+
+def _rsvp_invalid_page(message: str) -> str:
+    return _rsvp_html_page("Lien invalide", f"<h1>Lien invalide</h1><p>{message}</p>")
+
+
+@app.post("/rsvp/register")
+def rsvp_register(payload: RsvpRegisterRequest) -> dict[str, Any]:
+    if _normalize_license_key(payload.product_code) != _normalize_license_key(str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE)):
+        raise HTTPException(status_code=400, detail="product_code invalide.")
+
+    machine_hash = _machine_fingerprint(payload.machine_id) if payload.machine_id else ""
+    now = _utc_now()
+
+    with _db() as con:
+        license_row = _license_row_from_activation(con, payload.activation_id, machine_hash)
+        license_key = str(license_row["license_key"])
+        status_error = _license_status_error(license_row)
+        if status_error:
+            raise HTTPException(status_code=403, detail=f"Licence {status_error}.")
+
+        relay_id = _random_relay_id()
+        relay_secret = _random_relay_secret()
+        con.execute(
+            """
+            INSERT INTO rsvp_installations(relay_id, relay_secret, license_key, created_at, last_sync_at)
+            VALUES (?, ?, ?, ?, '')
+            """,
+            (relay_id, relay_secret, license_key, _iso(now)),
+        )
+        _log_event(
+            "rsvp_register",
+            license_key=license_key,
+            activation_id=payload.activation_id.strip(),
+            machine_hash=machine_hash,
+            details={"relay_id": relay_id, "machine_id": payload.machine_id.strip()},
+            con=con,
+        )
+        return {"ok": True, "relay_id": relay_id, "relay_secret": relay_secret}
+
+
+class RsvpAckRequest(BaseModel):
+    tokens: list[str] = Field(default_factory=list)
+
+
+# Routes /rsvp/sync/... déclarées AVANT /rsvp/{relay_id}/{token} : FastAPI
+# fait correspondre les routes dans l'ordre de déclaration, et {relay_id}/{token}
+# capturerait sinon "sync"/"<relay_id>" comme s'il s'agissait d'un jeton invité.
+@app.get("/rsvp/sync/{relay_id}")
+def rsvp_sync(relay_id: str, x_relay_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    now = _utc_now()
+    with _db() as con:
+        _require_relay_installation(con, relay_id, x_relay_secret)
+        rows = con.execute(
+            "SELECT guest_token, answer, comment, updated_at FROM rsvp_pending WHERE relay_id=? ORDER BY id",
+            (relay_id,),
+        ).fetchall()
+        con.execute(
+            "UPDATE rsvp_installations SET last_sync_at=? WHERE relay_id=?",
+            (_iso(now), relay_id),
+        )
+        return {
+            "ok": True,
+            "items": [
+                {
+                    "token": str(r["guest_token"]),
+                    "answer": str(r["answer"]),
+                    "comment": str(r["comment"] or ""),
+                    "updated_at": str(r["updated_at"]),
+                }
+                for r in rows
+            ],
+        }
+
+
+@app.post("/rsvp/sync/{relay_id}/ack")
+def rsvp_sync_ack(relay_id: str, payload: RsvpAckRequest, x_relay_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    with _db() as con:
+        _require_relay_installation(con, relay_id, x_relay_secret)
+        tokens = [str(t).strip() for t in (payload.tokens or []) if str(t or "").strip()]
+        deleted = 0
+        for t in tokens:
+            cur = con.execute(
+                "DELETE FROM rsvp_pending WHERE relay_id=? AND guest_token=?",
+                (relay_id, t),
+            )
+            deleted += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        return {"ok": True, "deleted": deleted}
+
+
+# Chemin /{relay_id}/rsvp (jeton en paramètre de requête ?t=...), et non
+# /rsvp/{relay_id}/{token} : voir le commentaire dans _rsvp_form_page.
+@app.get("/{relay_id}/rsvp", response_class=HTMLResponse)
+def rsvp_form(relay_id: str, t: str = "") -> HTMLResponse:
+    token = str(t or "").strip()
+    with _db() as con:
+        installation = con.execute(
+            "SELECT 1 FROM rsvp_installations WHERE relay_id=?", (str(relay_id or "").strip(),)
+        ).fetchone()
+        if installation is None:
+            return HTMLResponse(_rsvp_invalid_page("Ce lien ne correspond à aucun événement connu."), status_code=404)
+        if not token:
+            return HTMLResponse(_rsvp_invalid_page("Lien incomplet (jeton manquant)."), status_code=400)
+        existing = con.execute(
+            "SELECT answer, comment FROM rsvp_pending WHERE relay_id=? AND guest_token=?",
+            (relay_id, token),
+        ).fetchone()
+        current_answer = str(existing["answer"]) if existing else ""
+        current_comment = str(existing["comment"]) if existing else ""
+    return HTMLResponse(_rsvp_form_page(relay_id, token, current_answer, current_comment))
+
+
+@app.post("/{relay_id}/rsvp", response_class=HTMLResponse)
+def rsvp_submit(relay_id: str, t: str = "", answer: str = Form(...), comment: str = Form(default="")) -> HTMLResponse:
+    token = str(t or "").strip()
+    answer = str(answer or "").strip().lower()
+    if answer not in _RSVP_ANSWER_LABELS:
+        return HTMLResponse(_rsvp_invalid_page("Réponse non reconnue."), status_code=400)
+    comment = str(comment or "").strip()[:500]
+    now = _utc_now()
+
+    with _db() as con:
+        installation = con.execute(
+            "SELECT 1 FROM rsvp_installations WHERE relay_id=?", (str(relay_id or "").strip(),)
+        ).fetchone()
+        if installation is None:
+            return HTMLResponse(_rsvp_invalid_page("Ce lien ne correspond à aucun événement connu."), status_code=404)
+        if not token:
+            return HTMLResponse(_rsvp_invalid_page("Lien incomplet (jeton manquant)."), status_code=400)
+        con.execute(
+            """
+            INSERT INTO rsvp_pending(relay_id, guest_token, answer, comment, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(relay_id, guest_token)
+            DO UPDATE SET answer=excluded.answer, comment=excluded.comment, updated_at=excluded.updated_at
+            """,
+            (relay_id, token, answer, comment, _iso(now), _iso(now)),
+        )
+        _log_event("rsvp_answer_received", details={"relay_id": relay_id, "answer": answer}, con=con)
+    return HTMLResponse(_rsvp_confirm_page(answer))
 
 
 if __name__ == "__main__":
