@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import html as _html
 import json
 import os
 import secrets
@@ -277,6 +278,23 @@ def _ensure_schema() -> None:
             )
             """
         )
+        # Détails complets d'une réponse « Oui » (accompagnants, menu,
+        # régime) — même chose que ce que demande déjà le portail RSVP en
+        # direct. Migration pour les installations qui avaient déjà
+        # rsvp_pending sans ces colonnes.
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(rsvp_pending)")}
+        for col, ddl in (
+            ("plus_ones", "INTEGER NOT NULL DEFAULT 0"),
+            ("children", "INTEGER NOT NULL DEFAULT 0"),
+            ("meal", "TEXT NOT NULL DEFAULT ''"),
+            ("diet", "TEXT NOT NULL DEFAULT ''"),
+            ("companions_json", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if col not in cols:
+                try:
+                    con.execute(f"ALTER TABLE rsvp_pending ADD COLUMN {col} {ddl}")
+                except Exception:
+                    pass
 
 
 def _seed_demo_license() -> None:
@@ -1320,20 +1338,29 @@ def _rsvp_html_page(title: str, body: str) -> str:
                   cursor:pointer; margin:0; font-size:14px; flex:1; text-align:center; }}
   .choix input {{ display:none; }}
   .choix input:checked + span {{ font-weight:700; }}
-  textarea {{ width:100%; box-sizing:border-box; background:#0b1224; color:#f4f7fb; border:1px solid #2a3550;
-              border-radius:8px; padding:10px; font-family:inherit; font-size:14px; min-height:70px; }}
+  textarea, input[type="text"], input[type="number"], select {{
+              width:100%; box-sizing:border-box; background:#0b1224; color:#f4f7fb; border:1px solid #2a3550;
+              border-radius:8px; padding:10px; font-family:inherit; font-size:14px; }}
+  textarea {{ min-height:70px; }}
+  .row {{ display:flex; gap:8px; }}
+  .row > div {{ flex:1; }}
   button {{ margin-top:18px; width:100%; padding:12px; background:#2563eb; color:#fff; border:none;
             border-radius:8px; font-size:15px; cursor:pointer; }}
   p.hint {{ color:#8b95ab; font-size:13px; }}
+  .souscat {{ font-weight:700; font-size:12px; color:#7c9cff; margin:16px 0 2px; }}
 </style></head>
 <body><div class="card">{body}</div></body></html>"""
 
 
-def _rsvp_form_page(relay_id: str, token: str, current_answer: str = "", current_comment: str = "") -> str:
+def _rsvp_form_page(relay_id: str, token: str, current_answer: str = "", current_comment: str = "",
+                     current_plus_ones: int = 0, current_children: int = 0,
+                     current_meal: str = "", current_diet: str = "",
+                     current_companions: list | None = None) -> str:
     options = ""
     for value, label in (("oui", "Présent(e)"), ("non", "Absent(e)"), ("peut-être", "Incertain(e)")):
         checked = "checked" if value == current_answer else ""
-        options += f'<label><input type="radio" name="answer" value="{value}" {checked} required><span>{label}</span></label>'
+        options += (f'<label><input type="radio" name="answer" value="{value}" {checked} required '
+                    f'onchange="_toggleExtra()"><span>{label}</span></label>')
     # Le jeton reste en paramètre de requête (?t=...), pas en segment de
     # chemin : ça permet à /{relay_id}/rsvp de correspondre exactement au
     # format déjà utilisé par le logiciel client pour ses propres liens
@@ -1341,15 +1368,95 @@ def _rsvp_form_page(relay_id: str, token: str, current_answer: str = "", current
     # à changer côté appelant.
     from urllib.parse import quote
     action = f"/{quote(str(relay_id), safe='')}/rsvp?t={quote(str(token), safe='')}"
+    import json as _json
+    # Réponse (commentaire/menu/régime) et noms d'accompagnants : texte saisi
+    # par un invité, jamais fait confiance tel quel — échappé avant d'être
+    # réinjecté dans la page (elle est reservie telle quelle si l'invité
+    # rouvre son lien). Pour le JSON injecté dans <script>, on échappe aussi
+    # "<" pour empêcher une évasion via "</script>" dans un nom.
+    current_comment = _html.escape(str(current_comment or ""))
+    current_meal = _html.escape(str(current_meal or ""))
+    current_diet = _html.escape(str(current_diet or ""))
+    companions_js = _json.dumps(current_companions or [], ensure_ascii=False).replace("<", "\\u003c")
+    # Même informations que le portail RSVP en direct (accompagnants, menu,
+    # régime) — affichées seulement si « Présent(e) » est coché, en JS, pour
+    # rester en un seul aller-retour (pas de second POST intermédiaire comme
+    # sur le portail en direct).
     body = f"""
       <h1>Confirmez votre présence</h1>
-      <form method="post" action="{action}">
+      <form method="post" action="{action}" onsubmit="return _beforeSubmit()">
         <div class="choix">{options}</div>
+
+        <div id="extra" style="display:none">
+          <div class="row">
+            <div><label>Accompagnants adultes</label>
+              <input type="number" id="po" name="plus_ones" min="0" max="20" value="{int(current_plus_ones or 0)}"
+                     inputmode="numeric" oninput="_rebuildNames()"></div>
+            <div><label>Enfants</label>
+              <input type="number" id="ch" name="children" min="0" max="20" value="{int(current_children or 0)}"
+                     inputmode="numeric" oninput="_rebuildNames()"></div>
+          </div>
+          <div id="names"></div>
+          <label>Choix du menu / préférence (facultatif)</label>
+          <input type="text" name="meal" value="{current_meal}" placeholder="ex. plat végétarien">
+          <label>Allergies / régime alimentaire (facultatif)</label>
+          <textarea name="diet" placeholder="ex. sans gluten, allergie arachide…">{current_diet}</textarea>
+          <input type="hidden" name="companions" id="companions">
+        </div>
+
         <label for="comment">Un mot pour l'organisateur (facultatif)</label>
         <textarea id="comment" name="comment">{current_comment}</textarea>
         <button type="submit">Envoyer ma réponse</button>
       </form>
       <p class="hint">Votre réponse sera prise en compte dès que l'organisateur sera reconnecté.</p>
+    <script>
+      var _savedCompanions = {companions_js};
+      function _toggleExtra() {{
+        var oui = document.querySelector('input[name="answer"]:checked');
+        var vis = !!(oui && oui.value === 'oui');
+        document.getElementById('extra').style.display = vis ? 'block' : 'none';
+        if (vis) _rebuildNames();
+      }}
+      function _esc(s) {{
+        // Les noms d'accompagnants viennent d'un invité, jamais fait confiance
+        // tel quel avant de le réinjecter dans du HTML via innerHTML.
+        var d = document.createElement('div');
+        d.textContent = String(s == null ? '' : s);
+        return d.innerHTML.replace(/"/g, '&quot;');
+      }}
+      function _cRows(kind, label, n) {{
+        var h = '';
+        for (var i = 0; i < n; i++) {{
+          var saved = _savedCompanions.filter(function(c) {{ return c.type === kind; }})[i] || {{}};
+          h += '<div class="row"><div><label>' + label + ' ' + (i+1) + ' — prénom</label>' +
+               '<input type="text" class="cn-fn" data-kind="' + kind + '" value="' + _esc(saved.first_name) +
+               '" autocomplete="off"></div>' +
+               '<div><label>nom</label><input type="text" class="cn-ln" data-kind="' + kind + '" value="' +
+               _esc(saved.last_name) + '" autocomplete="off"></div></div>';
+        }}
+        return h;
+      }}
+      function _rebuildNames() {{
+        var poEl = document.getElementById('po'), chEl = document.getElementById('ch');
+        var p = Math.max(0, Math.min(20, parseInt((poEl && poEl.value) || 0) || 0));
+        var c = Math.max(0, Math.min(20, parseInt((chEl && chEl.value) || 0) || 0));
+        var el = document.getElementById('names'); if (!el) return;
+        var t = (p || c) ? '<div class="souscat">Noms pour le plan de table (facultatif)</div>' : '';
+        el.innerHTML = t + _cRows('adult', 'Adulte', p) + _cRows('child', 'Enfant', c);
+      }}
+      function _beforeSubmit() {{
+        var list = [];
+        document.querySelectorAll('.cn-fn').forEach(function(fnEl, i) {{
+          var lnEl = document.querySelectorAll('.cn-ln')[i];
+          var fn = (fnEl.value || '').trim(), ln = (lnEl && lnEl.value || '').trim();
+          if (fn || ln) list.push({{type: fnEl.getAttribute('data-kind'), first_name: fn, last_name: ln}});
+        }});
+        var el = document.getElementById('companions');
+        if (el) el.value = JSON.stringify(list);
+        return true;
+      }}
+      _toggleExtra();
+    </script>
     """
     return _rsvp_html_page("Confirmez votre présence", body)
 
@@ -1417,25 +1524,34 @@ def rsvp_sync(relay_id: str, x_relay_secret: str | None = Header(default=None)) 
     with _db() as con:
         _require_relay_installation(con, relay_id, x_relay_secret)
         rows = con.execute(
-            "SELECT guest_token, answer, comment, updated_at FROM rsvp_pending WHERE relay_id=? ORDER BY id",
+            "SELECT guest_token, answer, comment, plus_ones, children, meal, diet, "
+            "companions_json, updated_at FROM rsvp_pending WHERE relay_id=? ORDER BY id",
             (relay_id,),
         ).fetchall()
         con.execute(
             "UPDATE rsvp_installations SET last_sync_at=? WHERE relay_id=?",
             (_iso(now), relay_id),
         )
-        return {
-            "ok": True,
-            "items": [
-                {
-                    "token": str(r["guest_token"]),
-                    "answer": str(r["answer"]),
-                    "comment": str(r["comment"] or ""),
-                    "updated_at": str(r["updated_at"]),
-                }
-                for r in rows
-            ],
-        }
+        items = []
+        for r in rows:
+            try:
+                companions = json.loads(r["companions_json"] or "[]")
+                if not isinstance(companions, list):
+                    companions = []
+            except Exception:
+                companions = []
+            items.append({
+                "token": str(r["guest_token"]),
+                "answer": str(r["answer"]),
+                "comment": str(r["comment"] or ""),
+                "plus_ones": int(r["plus_ones"] or 0),
+                "children": int(r["children"] or 0),
+                "meal": str(r["meal"] or ""),
+                "diet": str(r["diet"] or ""),
+                "companions": companions,
+                "updated_at": str(r["updated_at"]),
+            })
+        return {"ok": True, "items": items}
 
 
 @app.post("/rsvp/sync/{relay_id}/ack")
@@ -1467,22 +1583,78 @@ def rsvp_form(relay_id: str, t: str = "") -> HTMLResponse:
         if not token:
             return HTMLResponse(_rsvp_invalid_page("Lien incomplet (jeton manquant)."), status_code=400)
         existing = con.execute(
-            "SELECT answer, comment FROM rsvp_pending WHERE relay_id=? AND guest_token=?",
+            "SELECT answer, comment, plus_ones, children, meal, diet, companions_json "
+            "FROM rsvp_pending WHERE relay_id=? AND guest_token=?",
             (relay_id, token),
         ).fetchone()
         current_answer = str(existing["answer"]) if existing else ""
         current_comment = str(existing["comment"]) if existing else ""
-    return HTMLResponse(_rsvp_form_page(relay_id, token, current_answer, current_comment))
+        current_plus_ones = int(existing["plus_ones"] or 0) if existing else 0
+        current_children = int(existing["children"] or 0) if existing else 0
+        current_meal = str(existing["meal"] or "") if existing else ""
+        current_diet = str(existing["diet"] or "") if existing else ""
+        try:
+            current_companions = json.loads((existing["companions_json"] if existing else "") or "[]")
+            if not isinstance(current_companions, list):
+                current_companions = []
+        except Exception:
+            current_companions = []
+    return HTMLResponse(_rsvp_form_page(relay_id, token, current_answer, current_comment,
+                                        current_plus_ones, current_children,
+                                        current_meal, current_diet, current_companions))
+
+
+def _int_bounded(v, lo=0, hi=20, default=0) -> int:
+    try:
+        return max(lo, min(hi, int(str(v).strip() or default)))
+    except Exception:
+        return default
 
 
 @app.post("/{relay_id}/rsvp", response_class=HTMLResponse)
-def rsvp_submit(relay_id: str, t: str = "", answer: str = Form(...), comment: str = Form(default="")) -> HTMLResponse:
+def rsvp_submit(relay_id: str, t: str = "", answer: str = Form(...), comment: str = Form(default=""),
+                plus_ones: str = Form(default="0"), children: str = Form(default="0"),
+                meal: str = Form(default=""), diet: str = Form(default=""),
+                companions: str = Form(default="")) -> HTMLResponse:
     token = str(t or "").strip()
     answer = str(answer or "").strip().lower()
     if answer not in _RSVP_ANSWER_LABELS:
         return HTMLResponse(_rsvp_invalid_page("Réponse non reconnue."), status_code=400)
     comment = str(comment or "").strip()[:500]
     now = _utc_now()
+
+    # Accompagnants/menu/régime : seulement pertinents pour « Oui », comme
+    # sur le portail RSVP en direct — on les ignore pour Non/Peut-être même
+    # si le navigateur les a envoyés (champs cachés non affichés côté client).
+    if answer == "oui":
+        po = _int_bounded(plus_ones, 0, 20, 0)
+        ch = _int_bounded(children, 0, 20, 0)
+        meal = str(meal or "").strip()[:200]
+        diet = str(diet or "").strip()[:500]
+        try:
+            companions_list = json.loads(companions or "[]")
+            if not isinstance(companions_list, list):
+                companions_list = []
+        except Exception:
+            companions_list = []
+        # Nettoie/borne chaque entrée (défense en profondeur : le JSON vient
+        # du navigateur d'un invité, jamais fait confiance tel quel).
+        cleaned = []
+        for c in companions_list[:40]:
+            if not isinstance(c, dict):
+                continue
+            kind = str(c.get("type") or "").strip()
+            if kind not in ("adult", "child"):
+                continue
+            fn = str(c.get("first_name") or "").strip()[:80]
+            ln = str(c.get("last_name") or "").strip()[:80]
+            if fn or ln:
+                cleaned.append({"type": kind, "first_name": fn, "last_name": ln})
+        companions_json = json.dumps(cleaned, ensure_ascii=False)
+    else:
+        po = ch = 0
+        meal = diet = ""
+        companions_json = ""
 
     with _db() as con:
         installation = con.execute(
@@ -1494,12 +1666,16 @@ def rsvp_submit(relay_id: str, t: str = "", answer: str = Form(...), comment: st
             return HTMLResponse(_rsvp_invalid_page("Lien incomplet (jeton manquant)."), status_code=400)
         con.execute(
             """
-            INSERT INTO rsvp_pending(relay_id, guest_token, answer, comment, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO rsvp_pending(relay_id, guest_token, answer, comment, plus_ones, children,
+                                     meal, diet, companions_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(relay_id, guest_token)
-            DO UPDATE SET answer=excluded.answer, comment=excluded.comment, updated_at=excluded.updated_at
+            DO UPDATE SET answer=excluded.answer, comment=excluded.comment,
+                          plus_ones=excluded.plus_ones, children=excluded.children,
+                          meal=excluded.meal, diet=excluded.diet,
+                          companions_json=excluded.companions_json, updated_at=excluded.updated_at
             """,
-            (relay_id, token, answer, comment, _iso(now), _iso(now)),
+            (relay_id, token, answer, comment, po, ch, meal, diet, companions_json, _iso(now), _iso(now)),
         )
         _log_event("rsvp_answer_received", details={"relay_id": relay_id, "answer": answer}, con=con)
     return HTMLResponse(_rsvp_confirm_page(answer))
