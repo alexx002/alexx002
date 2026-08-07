@@ -1319,37 +1319,67 @@ def delete_license(license_key: str, x_api_token: str | None = Header(default=No
 # pour ne rien perdre si le client plante avant d'avoir traité la réponse).
 # ═══════════════════════════════════════════════════════════════════════════
 
-_RSVP_ANSWER_LABELS = {"oui": "Présent(e)", "non": "Absent(e)", "peut-être": "Incertain(e)"}
+_RSVP_ANSWER_LABELS = {"oui": "Oui", "non": "Non", "peut-être": "Peut-être"}
+_RSVP_ANSWER_EMOJI = {"oui": "🎉", "non": "🤍", "peut-être": "🤔"}
 
 
 def _rsvp_html_page(title: str, body: str) -> str:
+    # Même thème (crème/or, carte arrondie, en-tête doré) que le portail RSVP
+    # en direct (ui/rsvp_portal.py, _RSVP_CSS) — pour que l'invité ne voie
+    # aucune différence visuelle entre les deux façons de répondre.
     return f"""<!DOCTYPE html>
 <html lang="fr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#efe7db">
 <title>{title}</title>
 <style>
-  body {{ font-family: -apple-system, Segoe UI, Arial, sans-serif; background:#0b1224; color:#f4f7fb;
-         display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:20px; }}
-  .card {{ background:#131b2e; border:1px solid #2a3550; border-radius:14px; padding:28px 24px; max-width:420px; width:100%; }}
-  h1 {{ font-size:20px; margin:0 0 16px; }}
-  label {{ display:block; margin:14px 0 6px; font-size:14px; color:#c7d0e0; }}
-  .choix {{ display:flex; gap:8px; flex-wrap:wrap; }}
-  .choix label {{ background:#1b2440; border:1px solid #2a3550; border-radius:8px; padding:10px 14px;
-                  cursor:pointer; margin:0; font-size:14px; flex:1; text-align:center; }}
+  :root {{ --ink:#2a2320; --muted:#8a7d72; --line:rgba(120,90,60,.16); --gold:#b08d57; --card:#fffdfa; }}
+  * {{ box-sizing:border-box; -webkit-tap-highlight-color:transparent; }}
+  body {{ margin:0; min-height:100vh; color:var(--ink);
+    font-family: system-ui,-apple-system,'Segoe UI',sans-serif;
+    background:
+      radial-gradient(1200px 500px at 50% -10%, #fbf3e6 0%, rgba(251,243,230,0) 60%),
+      linear-gradient(160deg,#f7f2ea 0%,#efe7db 100%);
+    display:flex; align-items:flex-start; justify-content:center;
+    padding:28px 16px calc(28px + env(safe-area-inset-bottom)); }}
+  .wrap {{ width:100%; max-width:460px; }}
+  .card {{ background:var(--card); border:1px solid var(--line); border-radius:22px;
+    box-shadow:0 18px 50px rgba(70,50,30,.12); overflow:hidden; }}
+  .top {{ height:6px; background:linear-gradient(90deg,#d9b877,#b08d57,#d9b877); }}
+  .pad {{ padding:30px 26px 26px; }}
+  h1 {{ font-family:Georgia,'Times New Roman',serif; font-weight:600;
+    text-align:center; font-size:26px; line-height:1.15; margin:0 0 18px; }}
+  label {{ display:block; font-weight:600; margin:14px 0 6px; font-size:13px; color:var(--ink); }}
+  .choix {{ display:flex; flex-direction:column; gap:11px; margin-bottom:6px; }}
+  .choix label {{ display:block; text-align:center; padding:15px; border-radius:13px;
+                  cursor:pointer; margin:0; font-size:16px; font-weight:700;
+                  background:#fff; color:var(--ink); border:1.5px solid var(--line);
+                  transition:transform .08s, filter .15s; }}
+  .choix label:active {{ transform:scale(.985); }}
   .choix input {{ display:none; }}
-  .choix input:checked + span {{ font-weight:700; }}
-  textarea, input[type="text"], input[type="number"], select {{
-              width:100%; box-sizing:border-box; background:#0b1224; color:#f4f7fb; border:1px solid #2a3550;
-              border-radius:8px; padding:10px; font-family:inherit; font-size:14px; }}
+  .choix input:checked + span {{ }}
+  .choix label.c-oui {{ background:linear-gradient(180deg,#3fbf72,#2f9e5c); color:#fff; border:none; }}
+  .choix input:not(:checked) ~ span {{ }}
+  .choix label.c-oui:has(input:not(:checked)) {{ background:#fff; color:#2f9e5c; border:1.5px solid #b7e3c8; }}
+  .choix label.c-mb {{ color:#a9781c; border:1.5px solid #e6c98a; }}
+  .choix label.c-mb:has(input:checked) {{ background:#fbf3de; }}
+  .choix label.c-non {{ color:#b5473d; border:1.5px solid #e7b4ac; }}
+  .choix label.c-non:has(input:checked) {{ background:#fbe9e6; }}
+  textarea, input[type="text"], input[type="number"] {{
+              width:100%; box-sizing:border-box; background:#fff; color:var(--ink);
+              border:1px solid var(--line); border-radius:12px; padding:11px 12px;
+              font-family:inherit; font-size:15px; }}
   textarea {{ min-height:70px; }}
-  .row {{ display:flex; gap:8px; }}
+  .row {{ display:flex; gap:10px; }}
   .row > div {{ flex:1; }}
-  button {{ margin-top:18px; width:100%; padding:12px; background:#2563eb; color:#fff; border:none;
-            border-radius:8px; font-size:15px; cursor:pointer; }}
-  p.hint {{ color:#8b95ab; font-size:13px; }}
-  .souscat {{ font-weight:700; font-size:12px; color:#7c9cff; margin:16px 0 2px; }}
+  button {{ margin-top:20px; width:100%; padding:14px; border:none; border-radius:13px;
+            background:var(--gold); color:#fff; font-size:16px; font-weight:700; cursor:pointer; }}
+  p.hint {{ color:var(--muted); font-size:12.5px; text-align:center; margin:16px 0 0; }}
+  .souscat {{ font-weight:700; font-size:12px; color:var(--gold); margin:16px 0 2px; }}
+  .emoji {{ font-size:52px; text-align:center; margin:2px 0 8px; }}
+  .greet {{ text-align:center; font-size:16px; margin:0 0 4px; }}
 </style></head>
-<body><div class="card">{body}</div></body></html>"""
+<body><div class="wrap"><div class="card"><div class="top"></div><div class="pad">{body}</div></div></div></body></html>"""
 
 
 def _rsvp_form_page(relay_id: str, token: str, current_answer: str = "", current_comment: str = "",
@@ -1357,9 +1387,11 @@ def _rsvp_form_page(relay_id: str, token: str, current_answer: str = "", current
                      current_meal: str = "", current_diet: str = "",
                      current_companions: list | None = None) -> str:
     options = ""
-    for value, label in (("oui", "Présent(e)"), ("non", "Absent(e)"), ("peut-être", "Incertain(e)")):
+    for value, label, css in (("oui", "Oui, avec joie !", "c-oui"),
+                              ("peut-être", "Peut-être", "c-mb"),
+                              ("non", "Non, je ne pourrai pas", "c-non")):
         checked = "checked" if value == current_answer else ""
-        options += (f'<label><input type="radio" name="answer" value="{value}" {checked} required '
+        options += (f'<label class="{css}"><input type="radio" name="answer" value="{value}" {checked} required '
                     f'onchange="_toggleExtra()"><span>{label}</span></label>')
     # Le jeton reste en paramètre de requête (?t=...), pas en segment de
     # chemin : ça permet à /{relay_id}/rsvp de correspondre exactement au
@@ -1463,9 +1495,11 @@ def _rsvp_form_page(relay_id: str, token: str, current_answer: str = "", current
 
 def _rsvp_confirm_page(answer: str) -> str:
     label = _RSVP_ANSWER_LABELS.get(answer, answer)
+    emoji = _RSVP_ANSWER_EMOJI.get(answer, "✅")
     body = f"""
+      <div class="emoji">{emoji}</div>
       <h1>Merci !</h1>
-      <p>Votre réponse (« {label} ») a bien été enregistrée.</p>
+      <p class="greet">Votre réponse « <b>{label}</b> » a bien été enregistrée.</p>
       <p class="hint">Elle sera prise en compte dès que l'organisateur sera reconnecté —
       vous pouvez revenir sur ce lien à tout moment pour la modifier.</p>
     """
@@ -1473,7 +1507,12 @@ def _rsvp_confirm_page(answer: str) -> str:
 
 
 def _rsvp_invalid_page(message: str) -> str:
-    return _rsvp_html_page("Lien invalide", f"<h1>Lien invalide</h1><p>{message}</p>")
+    body = f"""
+      <div class="emoji">🌸</div>
+      <h1>Oups…</h1>
+      <p class="greet">{message}</p>
+    """
+    return _rsvp_html_page("Lien invalide", body)
 
 
 @app.post("/rsvp/register")
