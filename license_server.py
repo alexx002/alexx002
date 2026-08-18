@@ -1304,6 +1304,517 @@ def delete_license(license_key: str, x_api_token: str | None = Header(default=No
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Interface d'administration mobile
+#
+# Page statique uniquement : c'est un client JavaScript qui appelle les
+# endpoints /admin/* CI-DESSUS, INCHANGÉS, avec le même header x-api-token
+# que n'importe quel autre appelant de l'API (logiciel client, curl…).
+# Aucune fonction ni aucun endpoint existant n'est modifié — une seule route
+# GET statique est ajoutée, plus bas.
+#
+# Sécurité :
+#   • le jeton n'est JAMAIS écrit dans le HTML renvoyé par le serveur — cette
+#     page ne contient aucune donnée dynamique interpolée côté serveur, elle
+#     est strictement identique pour tout le monde ;
+#   • il est saisi par l'utilisateur dans son navigateur, gardé en mémoire
+#     JS et en sessionStorage (effacé à la fermeture de l'onglet) — jamais en
+#     localStorage, qui persisterait indéfiniment sur le téléphone ;
+#   • il n'est jamais placé dans une URL, toujours en en-tête HTTP ;
+#   • le serveur ne journalise aucun en-tête de requête (_log_event()
+#     n'a jamais reçu x_api_token, avant comme après ce changement).
+# ═══════════════════════════════════════════════════════════════════════════
+
+_ADMIN_MOBILE_HTML = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#1c1a17">
+<title>Administration — EventManagerPro</title>
+<style>
+  :root { --ink:#1c1a17; --muted:#7a7168; --line:rgba(120,90,60,.14); --gold:#b08d57;
+    --bg:#f6f3ee; --card:#ffffff; --danger:#c0392b; --ok:#2f9e5c; --warn:#b8860b; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+    padding-bottom:calc(24px + env(safe-area-inset-bottom)); }
+  header { position:sticky; top:0; z-index:10; background:var(--ink); color:#fff;
+    padding:calc(14px + env(safe-area-inset-top)) 18px 14px;
+    display:flex; align-items:center; justify-content:space-between; }
+  header h1 { font-size:17px; margin:0; font-weight:700; letter-spacing:.2px; }
+  header button { background:none; border:1px solid rgba(255,255,255,.35); color:#fff;
+    padding:8px 12px; border-radius:10px; font-size:13px; }
+  main { max-width:640px; margin:0 auto; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:16px;
+    padding:18px; margin-bottom:16px; box-shadow:0 6px 20px rgba(40,30,15,.06); }
+  h2 { font-size:15px; margin:0 0 14px; font-weight:700; }
+  label { display:block; font-size:12.5px; font-weight:600; margin:12px 0 6px; color:var(--muted); }
+  input[type=text], input[type=number], input[type=password], select, textarea {
+    width:100%; font-size:16px; padding:12px 13px; border:1px solid var(--line);
+    border-radius:12px; background:#fff; color:var(--ink); font-family:inherit;
+    -webkit-appearance:none; appearance:none; }
+  textarea { min-height:64px; resize:vertical; }
+  .row { display:flex; gap:10px; }
+  .row > div { flex:1; min-width:0; }
+  button.primary { width:100%; margin-top:16px; padding:14px; border:none; border-radius:12px;
+    background:var(--gold); color:#fff; font-size:16px; font-weight:700; }
+  button.ghost { padding:9px 12px; border-radius:10px; border:1px solid var(--line);
+    background:#fff; color:var(--ink); font-size:13px; font-weight:600; }
+  button.danger-ghost { padding:9px 12px; border-radius:10px; border:1px solid rgba(192,57,43,.35);
+    background:#fff; color:var(--danger); font-size:13px; font-weight:600; }
+  button:disabled { opacity:.5; }
+  .msg { font-size:13px; padding:11px 13px; border-radius:11px; margin:0 0 14px; }
+  .msg.err { background:#fbe9e6; color:var(--danger); }
+  .msg.ok { background:#eaf6ee; color:var(--ok); }
+  #view-login { min-height:80vh; display:flex; align-items:center; justify-content:center; padding:20px; }
+  #view-login .card { width:100%; max-width:360px; }
+  .lic { border-bottom:1px solid var(--line); padding:14px 0; }
+  .lic:last-child { border-bottom:none; }
+  .lic-top { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
+  .lic-name { font-weight:700; font-size:15px; }
+  .lic-plan { color:var(--muted); font-size:12.5px; margin-top:2px; }
+  .badge { font-size:11px; font-weight:700; padding:4px 9px; border-radius:20px; white-space:nowrap; }
+  .badge.active { background:#eaf6ee; color:var(--ok); }
+  .badge.blocked, .badge.revoked { background:#fbe9e6; color:var(--danger); }
+  .badge.expired { background:#f1eee8; color:var(--muted); }
+  .badge.trial { background:#fbf3de; color:var(--warn); }
+  .lic-key { font-family:ui-monospace,Menlo,monospace; font-size:12.5px; color:var(--muted);
+    margin-top:6px; word-break:break-all; }
+  .lic-meta { font-size:12px; color:var(--muted); margin-top:4px; }
+  .lic-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  .keybox { background:#fbf7ee; border:1.5px dashed var(--gold); border-radius:13px;
+    padding:16px; text-align:center; margin-bottom:16px; }
+  .keybox .k { font-family:ui-monospace,Menlo,monospace; font-size:20px; font-weight:700;
+    letter-spacing:1px; word-break:break-all; margin:6px 0 12px; }
+  .overlay { position:fixed; inset:0; background:rgba(20,15,8,.45); display:flex;
+    align-items:flex-end; justify-content:center; z-index:50; }
+  .sheet { background:#fff; width:100%; max-width:480px; border-radius:20px 20px 0 0;
+    padding:20px 20px calc(20px + env(safe-area-inset-bottom)); max-height:82vh; overflow:auto; }
+  .sheet h3 { margin:0 0 14px; font-size:16px; }
+  .act-row { padding:10px 0; border-bottom:1px solid var(--line); font-size:13px; }
+  .act-row:last-child { border-bottom:none; }
+  .act-row .n { font-weight:700; }
+  .act-row .s { color:var(--muted); }
+  .hidden { display:none !important; }
+  .spinner { display:inline-block; width:16px; height:16px; border:2px solid rgba(0,0,0,.15);
+    border-top-color:var(--gold); border-radius:50%; animation:spin .7s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .empty { text-align:center; color:var(--muted); font-size:13.5px; padding:20px 0; }
+</style>
+</head>
+<body>
+
+<div id="view-login">
+  <div class="card">
+    <h2>Administration EventManagerPro</h2>
+    <div id="login-msg"></div>
+    <label for="login-token">Jeton d'administration</label>
+    <input type="password" id="login-token" autocomplete="off" autocapitalize="off"
+           autocorrect="off" spellcheck="false" placeholder="x-api-token">
+    <button class="primary" id="login-btn" onclick="doLogin()">Se connecter</button>
+  </div>
+</div>
+
+<div id="view-main" class="hidden">
+  <header>
+    <h1>Licences</h1>
+    <button onclick="doLogout()">Déconnexion</button>
+  </header>
+  <main>
+    <div id="main-msg"></div>
+
+    <div class="card">
+      <h2>Nouvelle licence</h2>
+      <label for="f-customer">Nom du client</label>
+      <input type="text" id="f-customer" autocomplete="off" placeholder="ex. Sophie et Marc">
+
+      <label for="f-plan">Formule</label>
+      <select id="f-plan">
+        <option value="Basic">Basic</option>
+        <option value="Pro" selected>Pro</option>
+        <option value="Expert">Expert</option>
+      </select>
+
+      <div class="row">
+        <div>
+          <label for="f-duration">Durée</label>
+          <select id="f-duration" onchange="onDurationChange()">
+            <option value="30">30 jours</option>
+            <option value="90">90 jours</option>
+            <option value="180">180 jours</option>
+            <option value="365" selected>1 an</option>
+            <option value="730">2 ans</option>
+            <option value="custom">Personnalisée…</option>
+          </select>
+        </div>
+        <div>
+          <label for="f-devices">Postes</label>
+          <input type="number" id="f-devices" min="1" max="100" value="2" inputmode="numeric">
+        </div>
+      </div>
+      <input type="number" id="f-duration-custom" class="hidden" min="1" max="3650"
+             inputmode="numeric" placeholder="Nombre de jours" style="margin-top:10px">
+
+      <label for="f-notes">Note (facultatif)</label>
+      <textarea id="f-notes" placeholder="ex. mariage du 12 juin 2027"></textarea>
+
+      <button class="primary" id="create-btn">Créer la licence</button>
+    </div>
+
+    <div id="new-key-card" class="card hidden">
+      <div class="keybox">
+        <div style="font-size:12.5px;color:var(--muted);font-weight:600;">Licence créée</div>
+        <div class="k" id="new-key-value"></div>
+        <button class="ghost" id="copy-key-btn">📋 Copier la clé</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Licences existantes</h2>
+      <div id="lic-list"><div class="empty">Chargement…</div></div>
+    </div>
+  </main>
+</div>
+
+<div id="overlay-root"></div>
+
+<script>
+(function () {
+  'use strict';
+  var STORAGE_KEY = 'emp_admin_token';
+  var token = '';
+  var currentKey = '';
+
+  function saveToken(t) { token = t; try { sessionStorage.setItem(STORAGE_KEY, t); } catch (e) {} }
+  function loadSavedToken() { try { return sessionStorage.getItem(STORAGE_KEY) || ''; } catch (e) { return ''; } }
+  function clearToken() { token = ''; try { sessionStorage.removeItem(STORAGE_KEY); } catch (e) {} }
+
+  function esc(s) {
+    var d = document.createElement('div');
+    d.textContent = (s === null || s === undefined) ? '' : String(s);
+    return d.innerHTML;
+  }
+  function escAttr(s) {
+    return String(s === null || s === undefined ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function api(path, opts) {
+    opts = opts || {};
+    var headers = Object.assign({ 'x-api-token': token }, opts.headers || {});
+    var init = { method: opts.method || 'GET', headers: headers };
+    if (opts.body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      init.body = JSON.stringify(opts.body);
+    }
+    return fetch(path, init).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        if (!res.ok) {
+          var detail = (data && data.detail) ? data.detail : ('Erreur ' + res.status);
+          var err = new Error(detail);
+          err.status = res.status;
+          throw err;
+        }
+        return data;
+      });
+    });
+  }
+
+  function showMsg(elId, text, isError) {
+    var el = document.getElementById(elId);
+    el.innerHTML = text ? ('<div class="msg ' + (isError ? 'err' : 'ok') + '">' + esc(text) + '</div>') : '';
+  }
+
+  // ── Connexion ────────────────────────────────────────────────────────
+  function doLogin() {
+    var t = (document.getElementById('login-token').value || '').trim();
+    if (!t) { showMsg('login-msg', "Entre le jeton d'administration.", true); return; }
+    var btn = document.getElementById('login-btn');
+    btn.disabled = true; btn.textContent = 'Connexion…';
+    token = t;
+    api('/admin/licenses').then(function (data) {
+      saveToken(t);
+      showMsg('login-msg', '');
+      document.getElementById('view-login').classList.add('hidden');
+      document.getElementById('view-main').classList.remove('hidden');
+      renderLicenses(data.items || []);
+    }).catch(function (err) {
+      token = '';
+      showMsg('login-msg', err.status === 401 ? 'Jeton invalide.' : err.message, true);
+    }).finally(function () {
+      btn.disabled = false; btn.textContent = 'Se connecter';
+    });
+  }
+
+  function doLogout() {
+    clearToken();
+    document.getElementById('login-token').value = '';
+    document.getElementById('view-main').classList.add('hidden');
+    document.getElementById('view-login').classList.remove('hidden');
+  }
+
+  // ── Formulaire de création ──────────────────────────────────────────
+  function onDurationChange() {
+    var sel = document.getElementById('f-duration');
+    document.getElementById('f-duration-custom').classList.toggle('hidden', sel.value !== 'custom');
+  }
+
+  function createLicense() {
+    var duration = document.getElementById('f-duration').value;
+    if (duration === 'custom') duration = document.getElementById('f-duration-custom').value;
+    duration = parseInt(duration, 10);
+    var devices = parseInt(document.getElementById('f-devices').value, 10);
+    if (!duration || duration < 1) { showMsg('main-msg', 'Durée invalide.', true); return; }
+    if (!devices || devices < 1) { showMsg('main-msg', 'Nombre de postes invalide.', true); return; }
+
+    var body = {
+      customer_name: document.getElementById('f-customer').value.trim(),
+      plan_name: document.getElementById('f-plan').value,
+      max_devices: devices,
+      duration_days: duration,
+      notes: document.getElementById('f-notes').value.trim()
+    };
+    var btn = document.getElementById('create-btn');
+    btn.disabled = true; btn.textContent = 'Création…';
+    api('/admin/licenses', { method: 'POST', body: body }).then(function (data) {
+      showMsg('main-msg', '');
+      document.getElementById('f-customer').value = '';
+      document.getElementById('f-notes').value = '';
+      document.getElementById('new-key-value').textContent = data.license_key;
+      document.getElementById('new-key-card').classList.remove('hidden');
+      loadLicenses();
+    }).catch(function (err) {
+      showMsg('main-msg', err.message, true);
+    }).finally(function () {
+      btn.disabled = false; btn.textContent = 'Créer la licence';
+    });
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(function () { fallbackCopy(text); });
+    } else {
+      fallbackCopy(text);
+    }
+  }
+  function fallbackCopy(text) {
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try { document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+  }
+
+  // ── Liste des licences ──────────────────────────────────────────────
+  function loadLicenses() {
+    api('/admin/licenses').then(function (data) { renderLicenses(data.items || []); })
+      .catch(function (err) { showMsg('main-msg', err.message, true); });
+  }
+
+  var STATUS_LABELS = { active: 'Active', blocked: 'Bloquée', revoked: 'Révoquée',
+                         expired: 'Expirée', trial: 'Essai' };
+  var PLAN_OPTIONS = ['Basic', 'Pro', 'Expert'];
+
+  function renderLicenses(items) {
+    var el = document.getElementById('lic-list');
+    if (!items.length) { el.innerHTML = '<div class="empty">Aucune licence.</div>'; return; }
+    el.innerHTML = items.map(function (it) {
+      var statusCls = STATUS_LABELS[it.status] ? it.status : 'expired';
+      var expires = it.expires_at ? it.expires_at.slice(0, 10) : '—';
+      return (
+        '<div class="lic">' +
+          '<div class="lic-top">' +
+            '<div>' +
+              '<div class="lic-name">' + esc(it.customer_name || '(sans nom)') + '</div>' +
+              '<div class="lic-plan">' + esc(it.plan_name) + ' · ' + it.used_devices + '/' + it.max_devices + ' postes</div>' +
+            '</div>' +
+            '<span class="badge ' + statusCls + '">' + (STATUS_LABELS[it.status] || esc(it.status)) + '</span>' +
+          '</div>' +
+          '<div class="lic-key">' + esc(it.license_key) + '</div>' +
+          '<div class="lic-meta">Expire le ' + expires + (it.notes ? ' · ' + esc(it.notes) : '') + '</div>' +
+          '<div class="lic-actions">' +
+            '<button class="ghost" data-act="activations" data-key="' + escAttr(it.license_key) + '">Activations</button>' +
+            '<button class="ghost" data-act="status" data-key="' + escAttr(it.license_key) + '" data-status="' + escAttr(it.status) + '">Statut</button>' +
+            '<button class="ghost" data-act="plan" data-key="' + escAttr(it.license_key) + '" data-plan="' + escAttr(it.plan_name) + '">Formule</button>' +
+            '<button class="danger-ghost" data-act="delete" data-key="' + escAttr(it.license_key) + '">Supprimer</button>' +
+          '</div>' +
+        '</div>'
+      );
+    }).join('');
+  }
+
+  // ── Feuilles modales ─────────────────────────────────────────────────
+  function openSheet(html) {
+    var root = document.getElementById('overlay-root');
+    var overlay = document.createElement('div');
+    overlay.className = 'overlay';
+    overlay.innerHTML = '<div class="sheet">' + html + '</div>';
+    overlay.addEventListener('click', function (ev) { if (ev.target === overlay) closeSheet(); });
+    root.innerHTML = '';
+    root.appendChild(overlay);
+  }
+  function closeSheet() { document.getElementById('overlay-root').innerHTML = ''; }
+
+  function openActivations(key) {
+    currentKey = key;
+    openSheet('<h3>Activations — ' + esc(key) + '</h3><div id="act-body">Chargement…</div>');
+    api('/admin/licenses/' + encodeURIComponent(key) + '/activations').then(function (data) {
+      var items = data.items || [];
+      var html = items.length ? items.map(function (a) {
+        return '<div class="act-row"><div class="n">' + esc(a.machine_name || a.hostname || a.machine_id || '(poste sans nom)') +
+          '</div><div class="s">' + esc(a.platform) + ' ' + esc(a.platform_release) + ' · ' + esc(a.status) +
+          '<br>Dernière validation : ' + esc((a.last_validated_at || '').slice(0, 16).replace('T', ' ')) + '</div></div>';
+      }).join('') : '<div class="empty">Aucune activation.</div>';
+      document.getElementById('act-body').innerHTML = html;
+    }).catch(function (err) {
+      document.getElementById('act-body').innerHTML = '<div class="msg err">' + esc(err.message) + '</div>';
+    });
+  }
+
+  function openStatus(key, current) {
+    currentKey = key;
+    var opts = Object.keys(STATUS_LABELS).map(function (s) {
+      return '<option value="' + s + '"' + (s === current ? ' selected' : '') + '>' + STATUS_LABELS[s] + '</option>';
+    }).join('');
+    openSheet(
+      '<h3>Statut — ' + esc(key) + '</h3>' +
+      '<label>Nouveau statut</label><select id="status-select">' + opts + '</select>' +
+      '<div id="status-msg"></div>' +
+      '<button class="primary" id="status-confirm-btn">Mettre à jour</button>'
+    );
+  }
+  function confirmStatus() {
+    var status = document.getElementById('status-select').value;
+    api('/admin/licenses/' + encodeURIComponent(currentKey) + '/status',
+        { method: 'PATCH', body: { status: status } }).then(function () {
+      closeSheet(); loadLicenses();
+    }).catch(function (err) {
+      document.getElementById('status-msg').innerHTML = '<div class="msg err">' + esc(err.message) + '</div>';
+    });
+  }
+
+  function openPlan(key, current) {
+    currentKey = key;
+    var opts = PLAN_OPTIONS.map(function (p) { return '<option value="' + p + '">' + p + '</option>'; }).join('');
+    openSheet(
+      '<h3>Changer de formule — ' + esc(key) + '</h3>' +
+      '<div class="lic-meta" style="margin-bottom:10px">Formule actuelle : ' + esc(current) + '</div>' +
+      '<label>Nouvelle formule</label><select id="plan-select">' + opts + '</select>' +
+      '<div id="plan-quote"></div>' +
+      '<div id="plan-msg"></div>' +
+      '<button class="ghost" id="plan-quote-btn" style="margin-top:14px;width:100%">Voir le montant proposé</button>' +
+      '<button class="primary" id="plan-confirm-btn">Appliquer</button>'
+    );
+  }
+  function quotePlan() {
+    var plan = document.getElementById('plan-select').value;
+    document.getElementById('plan-quote').innerHTML = '<div class="spinner"></div>';
+    api('/admin/licenses/' + encodeURIComponent(currentKey) + '/upgrade-quote?plan_name=' + encodeURIComponent(plan))
+      .then(function (data) {
+        var q = data.quote;
+        document.getElementById('plan-quote').innerHTML =
+          '<div class="lic-meta" style="margin:10px 0">Montant suggéré : <b>' + q.suggested_amount + ' €</b>' +
+          (q.expiry_reset ? ' (nouvelle période de licence)' : ' (échéance conservée)') + '</div>';
+      }).catch(function (err) {
+        document.getElementById('plan-quote').innerHTML = '<div class="msg err">' + esc(err.message) + '</div>';
+      });
+  }
+  function confirmPlan() {
+    var plan = document.getElementById('plan-select').value;
+    api('/admin/licenses/' + encodeURIComponent(currentKey) + '/plan',
+        { method: 'PATCH', body: { plan_name: plan } }).then(function () {
+      closeSheet(); loadLicenses();
+    }).catch(function (err) {
+      document.getElementById('plan-msg').innerHTML = '<div class="msg err">' + esc(err.message) + '</div>';
+    });
+  }
+
+  function openDelete(key) {
+    currentKey = key;
+    openSheet(
+      '<h3>Supprimer la licence</h3>' +
+      '<div class="lic-meta" style="margin-bottom:14px">Cette action est définitive et supprime aussi toutes ses activations. ' +
+      'Pour confirmer, saisis la clé complète : <b>' + esc(key) + '</b></div>' +
+      '<input type="text" id="del-confirm" autocomplete="off" autocapitalize="characters">' +
+      '<div id="del-msg"></div>' +
+      '<button class="primary" id="del-confirm-btn" style="background:var(--danger)">Supprimer définitivement</button>'
+    );
+  }
+  function confirmDelete() {
+    var typed = (document.getElementById('del-confirm').value || '').trim().toUpperCase();
+    if (typed !== currentKey.toUpperCase()) {
+      document.getElementById('del-msg').innerHTML = '<div class="msg err">La clé saisie ne correspond pas.</div>';
+      return;
+    }
+    api('/admin/licenses/' + encodeURIComponent(currentKey), { method: 'DELETE' }).then(function () {
+      closeSheet(); loadLicenses();
+    }).catch(function (err) {
+      document.getElementById('del-msg').innerHTML = '<div class="msg err">' + esc(err.message) + '</div>';
+    });
+  }
+
+  // ── Délégation d'évènements (aucune valeur dynamique dans du HTML/JS
+  // généré : clé, statut, formule circulent comme de vraies valeurs JS, pas
+  // comme du texte réinterprété) ─────────────────────────────────────────
+  document.getElementById('login-btn').addEventListener('click', doLogin);
+  document.getElementById('login-token').addEventListener('keydown', function (ev) {
+    if (ev.key === 'Enter') doLogin();
+  });
+  document.querySelector('header button').addEventListener('click', doLogout);
+  document.getElementById('f-duration').addEventListener('change', onDurationChange);
+  document.getElementById('create-btn').addEventListener('click', createLicense);
+  document.getElementById('copy-key-btn').addEventListener('click', function () {
+    copyText(document.getElementById('new-key-value').textContent);
+  });
+  document.getElementById('lic-list').addEventListener('click', function (ev) {
+    var btn = ev.target.closest('button[data-act]');
+    if (!btn) return;
+    var act = btn.getAttribute('data-act');
+    var key = btn.getAttribute('data-key');
+    if (act === 'activations') openActivations(key);
+    else if (act === 'status') openStatus(key, btn.getAttribute('data-status'));
+    else if (act === 'plan') openPlan(key, btn.getAttribute('data-plan'));
+    else if (act === 'delete') openDelete(key);
+  });
+  document.getElementById('overlay-root').addEventListener('click', function (ev) {
+    if (ev.target.id === 'status-confirm-btn') confirmStatus();
+    else if (ev.target.id === 'plan-quote-btn') quotePlan();
+    else if (ev.target.id === 'plan-confirm-btn') confirmPlan();
+    else if (ev.target.id === 'del-confirm-btn') confirmDelete();
+  });
+
+  // ── Démarrage : reprise de session si un jeton est déjà en mémoire ────
+  var saved = loadSavedToken();
+  if (saved) {
+    token = saved;
+    api('/admin/licenses').then(function (data) {
+      document.getElementById('view-login').classList.add('hidden');
+      document.getElementById('view-main').classList.remove('hidden');
+      renderLicenses(data.items || []);
+    }).catch(function () { clearToken(); });
+  }
+})();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/admin-mobile", response_class=HTMLResponse)
+def admin_mobile_page() -> HTMLResponse:
+    """Interface d'administration mobile — page STATIQUE uniquement : aucune
+    donnée n'est interpolée côté serveur (le même HTML est renvoyé à tout le
+    monde, jeton ou pas). Toutes les actions (création, liste, statut,
+    formule, activations, suppression) passent par les endpoints /admin/*
+    déjà existants et déjà protégés par _require_api_token — appelés
+    directement depuis le JavaScript du navigateur avec le header
+    x-api-token saisi par l'utilisateur. Rien n'est dupliqué ni modifié."""
+    return HTMLResponse(_ADMIN_MOBILE_HTML)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Boîte aux lettres RSVP
 #
 # Objectif : un invité peut répondre même quand le PC du client est éteint
