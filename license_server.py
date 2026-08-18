@@ -7,14 +7,16 @@ import json
 import os
 import secrets
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, Form, Header, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 
 APP_TITLE = "EventManagerPro License Server"
@@ -567,6 +569,24 @@ class CreateLicenseRequest(BaseModel):
 
 class UpdateLicenseStatusRequest(BaseModel):
     status: str
+    notes: str = Field(default="")
+
+
+class UpdateLicenseDetailsRequest(BaseModel):
+    """Nom du client / note — les deux seuls champs qu'aucun endpoint
+    existant ne permettait de corriger après création (une faute de frappe
+    dans le nom, par exemple, obligeait jusqu'ici à supprimer et recréer la
+    licence). N'affecte ni le statut, ni la formule, ni l'échéance."""
+    customer_name: str = Field(default="")
+    notes: str = Field(default="")
+
+
+class ExtendLicenseRequest(BaseModel):
+    """Prolonge l'échéance SANS changer de formule — utile pour un simple
+    renouvellement (le client reste au même plan encore un an), par
+    opposition à /plan qui sert à changer de formule et gère séparément la
+    règle de non-rétrogradation."""
+    additional_days: int = Field(ge=1, le=3650)
     notes: str = Field(default="")
 
 
@@ -1304,6 +1324,159 @@ def delete_license(license_key: str, x_api_token: str | None = Header(default=No
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Extensions admin additionnelles (nouveaux endpoints, aucun endpoint
+# ci-dessus modifié) : modifier nom/note, prolonger une échéance, consulter
+# le journal d'audit, télécharger une sauvegarde de la base.
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.patch("/admin/licenses/{license_key}/details")
+def update_license_details(
+    license_key: str,
+    payload: UpdateLicenseDetailsRequest,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Corrige le nom du client et/ou la note — aucun autre champ n'est
+    modifiable ici (statut, formule, échéance : voir les endpoints dédiés)."""
+    _require_api_token(x_api_token)
+    now = _utc_now()
+    with _db() as con:
+        row = _get_license_row(con, license_key)
+        con.execute(
+            "UPDATE licenses SET customer_name=?, notes=?, updated_at=? WHERE id=?",
+            (payload.customer_name.strip(), payload.notes.strip(), _iso(now), int(row["id"])),
+        )
+        updated = _get_license_row(con, license_key)
+        used_devices = _count_active_activations(con, int(updated["id"]))
+        _log_event(
+            "admin_update_details",
+            license_key=_normalize_license_key(license_key),
+            con=con,
+        )
+        return _row_to_license_payload(
+            updated,
+            used_devices=used_devices,
+            validated_at=now,
+            next_check_at=now + timedelta(days=int(updated["offline_grace_days"] or DEFAULT_OFFLINE_GRACE_DAYS)),
+            message="Informations mises à jour.",
+        )
+
+
+@app.patch("/admin/licenses/{license_key}/extend")
+def extend_license(
+    license_key: str,
+    payload: ExtendLicenseRequest,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Ajoute des jours à l'échéance actuelle, SANS toucher à la formule —
+    un simple renouvellement au même plan. Si l'échéance est déjà dépassée,
+    on repart d'aujourd'hui plutôt que d'empiler les jours sur une date
+    passée (sinon la licence resterait « expirée » malgré la prolongation)."""
+    _require_api_token(x_api_token)
+    now = _utc_now()
+    with _db() as con:
+        row = _get_license_row(con, license_key)
+        current_expiry = _parse_iso(row["expires_at"])
+        base_date = current_expiry if (current_expiry and current_expiry > now) else now
+        new_expiry = base_date + timedelta(days=int(payload.additional_days))
+        con.execute(
+            "UPDATE licenses SET expires_at=?, notes=?, updated_at=? WHERE id=?",
+            (
+                _iso(new_expiry),
+                payload.notes.strip() or str(row["notes"] or ""),
+                _iso(now),
+                int(row["id"]),
+            ),
+        )
+        updated = _get_license_row(con, license_key)
+        used_devices = _count_active_activations(con, int(updated["id"]))
+        _log_event(
+            "admin_extend_license",
+            license_key=_normalize_license_key(license_key),
+            details={"additional_days": int(payload.additional_days),
+                     "expires_at_before": _iso(current_expiry) if current_expiry else "",
+                     "expires_at_after": _iso(new_expiry)},
+            con=con,
+        )
+        return _row_to_license_payload(
+            updated,
+            used_devices=used_devices,
+            validated_at=now,
+            next_check_at=now + timedelta(days=int(updated["offline_grace_days"] or DEFAULT_OFFLINE_GRACE_DAYS)),
+            message=f"Échéance prolongée de {int(payload.additional_days)} jour(s).",
+        )
+
+
+@app.get("/admin/audit-log")
+def list_audit_log(
+    license_key: str = "",
+    limit: int = 200,
+    x_api_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Derniers événements du journal d'audit (table déjà existante, jamais
+    exposée jusqu'ici) — utile pour voir qui a fait quoi et quand, sans avoir
+    à ouvrir la base SQLite à la main. Filtrable par licence."""
+    _require_api_token(x_api_token)
+    safe_limit = max(1, min(1000, int(limit or 200)))
+    with _db() as con:
+        if license_key.strip():
+            rows = con.execute(
+                "SELECT event_type, license_key, activation_id, machine_hash, details_json, created_at "
+                "FROM audit_log WHERE license_key=? ORDER BY id DESC LIMIT ?",
+                (_normalize_license_key(license_key), safe_limit),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT event_type, license_key, activation_id, machine_hash, details_json, created_at "
+                "FROM audit_log ORDER BY id DESC LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        items = []
+        for r in rows:
+            try:
+                details = json.loads(r["details_json"] or "{}")
+                if not isinstance(details, dict):
+                    details = {}
+            except Exception:
+                details = {}
+            items.append({
+                "event_type": str(r["event_type"]),
+                "license_key": str(r["license_key"] or ""),
+                "activation_id": str(r["activation_id"] or ""),
+                "details": details,
+                "created_at": str(r["created_at"]),
+            })
+        return {"ok": True, "items": items}
+
+
+@app.get("/admin/backup")
+def download_backup(x_api_token: str | None = Header(default=None)) -> FileResponse:
+    """Télécharge une copie cohérente de la base de licences SQLite — filet
+    de sécurité en plus du disque persistant Render. Utilise l'API de
+    sauvegarde native de SQLite (Connection.backup), pas une simple copie de
+    fichier : sûr même si le serveur est en train d'écrire au même instant.
+    Le fichier temporaire produit est supprimé juste après l'envoi."""
+    _require_api_token(x_api_token)
+    _ensure_parent(DB_PATH)
+    fd, tmp_path = tempfile.mkstemp(prefix="license_server_backup_", suffix=".db")
+    os.close(fd)
+    source = sqlite3.connect(str(DB_PATH))
+    try:
+        dest = sqlite3.connect(tmp_path)
+        try:
+            source.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        source.close()
+    _log_event("admin_download_backup")
+    filename = f"license_server_backup_{_utc_now().strftime('%Y%m%d_%H%M%S')}.db"
+    return FileResponse(
+        tmp_path, filename=filename, media_type="application/octet-stream",
+        background=BackgroundTask(lambda: os.unlink(tmp_path) if os.path.exists(tmp_path) else None),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Interface d'administration mobile
 #
 # Page statique uniquement : c'est un client JavaScript qui appelle les
@@ -1403,6 +1576,17 @@ _ADMIN_MOBILE_HTML = """<!DOCTYPE html>
     border-top-color:var(--gold); border-radius:50%; animation:spin .7s linear infinite; }
   @keyframes spin { to { transform:rotate(360deg); } }
   .empty { text-align:center; color:var(--muted); font-size:13.5px; padding:20px 0; }
+  .stats { display:flex; gap:6px; margin-bottom:14px; }
+  .stat { flex:1; min-width:0; background:var(--bg); border:1px solid var(--line); border-radius:12px;
+    padding:9px 4px; text-align:center; }
+  .stat .n { font-size:17px; font-weight:800; }
+  .stat .l { font-size:9.5px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.2px;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .stat.warn .n { color:var(--warn); }
+  .audit-row { padding:9px 0; border-bottom:1px solid var(--line); font-size:12.5px; }
+  .audit-row:last-child { border-bottom:none; }
+  .audit-row .t { font-weight:700; }
+  .audit-row .d { color:var(--muted); }
 </style>
 </head>
 <body>
@@ -1474,7 +1658,18 @@ _ADMIN_MOBILE_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="card">
+      <h2>Outils</h2>
+      <div class="lic-actions">
+        <button class="ghost" id="audit-log-btn">🗂️ Journal d'audit</button>
+        <button class="ghost" id="backup-btn">💾 Sauvegarder la base</button>
+      </div>
+    </div>
+
+    <div class="card">
       <h2>Licences existantes</h2>
+      <div class="stats" id="stats-row"></div>
+      <input type="text" id="lic-search" autocomplete="off" placeholder="Rechercher un client ou une clé…"
+             style="margin-bottom:12px">
       <div id="lic-list"><div class="empty">Chargement…</div></div>
     </div>
   </main>
@@ -1541,7 +1736,7 @@ _ADMIN_MOBILE_HTML = """<!DOCTYPE html>
       showMsg('login-msg', '');
       document.getElementById('view-login').classList.add('hidden');
       document.getElementById('view-main').classList.remove('hidden');
-      renderLicenses(data.items || []);
+      applyLicenses(data.items);
     }).catch(function (err) {
       token = '';
       showMsg('login-msg', err.status === 401 ? 'Jeton invalide.' : err.message, true);
@@ -1610,14 +1805,49 @@ _ADMIN_MOBILE_HTML = """<!DOCTYPE html>
   }
 
   // ── Liste des licences ──────────────────────────────────────────────
+  var allLicenses = [];
+
+  function applyLicenses(items) {
+    allLicenses = items || [];
+    renderStats(allLicenses);
+    renderLicenses(filterLicenses(allLicenses, document.getElementById('lic-search').value));
+  }
+
   function loadLicenses() {
-    api('/admin/licenses').then(function (data) { renderLicenses(data.items || []); })
+    api('/admin/licenses').then(function (data) { applyLicenses(data.items); })
       .catch(function (err) { showMsg('main-msg', err.message, true); });
   }
 
   var STATUS_LABELS = { active: 'Active', blocked: 'Bloquée', revoked: 'Révoquée',
                          expired: 'Expirée', trial: 'Essai' };
   var PLAN_OPTIONS = ['Basic', 'Pro', 'Expert'];
+  var SOON_DAYS = 30;
+
+  function filterLicenses(items, term) {
+    term = (term || '').trim().toLowerCase();
+    if (!term) return items;
+    return items.filter(function (it) {
+      return (it.customer_name || '').toLowerCase().indexOf(term) !== -1 ||
+             (it.license_key || '').toLowerCase().indexOf(term) !== -1;
+    });
+  }
+
+  function renderStats(items) {
+    var now = new Date();
+    var soonLimit = new Date(now.getTime() + SOON_DAYS * 86400000);
+    var counts = { total: items.length, active: 0, blocked: 0, soon: 0 };
+    items.forEach(function (it) {
+      if (it.status === 'active' || it.status === 'trial') counts.active++;
+      if (it.status === 'blocked' || it.status === 'revoked') counts.blocked++;
+      var exp = it.expires_at ? new Date(it.expires_at) : null;
+      if (exp && exp > now && exp <= soonLimit && (it.status === 'active' || it.status === 'trial')) counts.soon++;
+    });
+    document.getElementById('stats-row').innerHTML =
+      '<div class="stat"><div class="n">' + counts.total + '</div><div class="l">Total</div></div>' +
+      '<div class="stat"><div class="n">' + counts.active + '</div><div class="l">Actives</div></div>' +
+      '<div class="stat"><div class="n">' + counts.blocked + '</div><div class="l">Bloquées</div></div>' +
+      '<div class="stat warn"><div class="n">' + counts.soon + '</div><div class="l">Expire &lt;30j</div></div>';
+  }
 
   function renderLicenses(items) {
     var el = document.getElementById('lic-list');
@@ -1640,6 +1870,9 @@ _ADMIN_MOBILE_HTML = """<!DOCTYPE html>
             '<button class="ghost" data-act="activations" data-key="' + escAttr(it.license_key) + '">Activations</button>' +
             '<button class="ghost" data-act="status" data-key="' + escAttr(it.license_key) + '" data-status="' + escAttr(it.status) + '">Statut</button>' +
             '<button class="ghost" data-act="plan" data-key="' + escAttr(it.license_key) + '" data-plan="' + escAttr(it.plan_name) + '">Formule</button>' +
+            '<button class="ghost" data-act="history" data-key="' + escAttr(it.license_key) + '">Historique</button>' +
+            '<button class="ghost" data-act="edit" data-key="' + escAttr(it.license_key) + '" data-customer="' + escAttr(it.customer_name) + '" data-notes="' + escAttr(it.notes) + '">Modifier</button>' +
+            '<button class="ghost" data-act="extend" data-key="' + escAttr(it.license_key) + '">Prolonger</button>' +
             '<button class="danger-ghost" data-act="delete" data-key="' + escAttr(it.license_key) + '">Supprimer</button>' +
           '</div>' +
         '</div>'
@@ -1757,6 +1990,108 @@ _ADMIN_MOBILE_HTML = """<!DOCTYPE html>
     });
   }
 
+  function openHistory(key) {
+    currentKey = key;
+    openSheet('<h3>Historique des formules — ' + esc(key) + '</h3><div id="hist-body">Chargement…</div>');
+    api('/admin/licenses/' + encodeURIComponent(key) + '/plan-changes').then(function (data) {
+      var items = data.items || [];
+      var html = items.length ? items.map(function (h) {
+        return '<div class="audit-row"><div class="t">' + esc(h.old_plan) + ' → ' + esc(h.new_plan) + '</div>' +
+          '<div class="d">' + esc((h.created_at || '').slice(0, 16).replace('T', ' ')) +
+          (h.amount_charged ? ' · ' + esc(h.amount_charged) + ' €' : '') +
+          (h.notes ? ' · ' + esc(h.notes) : '') + '</div></div>';
+      }).join('') : '<div class="empty">Aucun changement de formule.</div>';
+      document.getElementById('hist-body').innerHTML = html;
+    }).catch(function (err) {
+      document.getElementById('hist-body').innerHTML = '<div class="msg err">' + esc(err.message) + '</div>';
+    });
+  }
+
+  function openEdit(key, customer, notes) {
+    currentKey = key;
+    openSheet(
+      '<h3>Modifier — ' + esc(key) + '</h3>' +
+      '<label>Nom du client</label><input type="text" id="edit-customer" value="' + escAttr(customer) + '">' +
+      '<label>Note</label><textarea id="edit-notes">' + esc(notes) + '</textarea>' +
+      '<div id="edit-msg"></div>' +
+      '<button class="primary" id="edit-confirm-btn">Enregistrer</button>'
+    );
+  }
+  function confirmEdit() {
+    var body = {
+      customer_name: document.getElementById('edit-customer').value.trim(),
+      notes: document.getElementById('edit-notes').value.trim()
+    };
+    api('/admin/licenses/' + encodeURIComponent(currentKey) + '/details',
+        { method: 'PATCH', body: body }).then(function () {
+      closeSheet(); loadLicenses();
+    }).catch(function (err) {
+      document.getElementById('edit-msg').innerHTML = '<div class="msg err">' + esc(err.message) + '</div>';
+    });
+  }
+
+  function openExtend(key) {
+    currentKey = key;
+    openSheet(
+      '<h3>Prolonger l’échéance — ' + esc(key) + '</h3>' +
+      '<div class="lic-meta" style="margin-bottom:10px">La formule actuelle est conservée — seule la date d’échéance avance.</div>' +
+      '<label>Jours à ajouter</label>' +
+      '<input type="number" id="extend-days" min="1" max="3650" value="365" inputmode="numeric">' +
+      '<div id="extend-msg"></div>' +
+      '<button class="primary" id="extend-confirm-btn">Prolonger</button>'
+    );
+  }
+  function confirmExtend() {
+    var days = parseInt(document.getElementById('extend-days').value, 10);
+    if (!days || days < 1) {
+      document.getElementById('extend-msg').innerHTML = '<div class="msg err">Nombre de jours invalide.</div>';
+      return;
+    }
+    api('/admin/licenses/' + encodeURIComponent(currentKey) + '/extend',
+        { method: 'PATCH', body: { additional_days: days } }).then(function () {
+      closeSheet(); loadLicenses();
+    }).catch(function (err) {
+      document.getElementById('extend-msg').innerHTML = '<div class="msg err">' + esc(err.message) + '</div>';
+    });
+  }
+
+  function openAuditLog() {
+    openSheet('<h3>Journal d’audit</h3><div id="audit-body">Chargement…</div>');
+    api('/admin/audit-log?limit=100').then(function (data) {
+      var items = data.items || [];
+      var html = items.length ? items.map(function (a) {
+        return '<div class="audit-row"><div class="t">' + esc(a.event_type) +
+          (a.license_key ? ' · ' + esc(a.license_key) : '') + '</div>' +
+          '<div class="d">' + esc((a.created_at || '').slice(0, 16).replace('T', ' ')) + '</div></div>';
+      }).join('') : '<div class="empty">Aucun événement.</div>';
+      document.getElementById('audit-body').innerHTML = html;
+    }).catch(function (err) {
+      document.getElementById('audit-body').innerHTML = '<div class="msg err">' + esc(err.message) + '</div>';
+    });
+  }
+
+  function downloadBackup() {
+    var btn = document.getElementById('backup-btn');
+    btn.disabled = true; btn.textContent = 'Préparation…';
+    fetch('/admin/backup', { headers: { 'x-api-token': token } }).then(function (res) {
+      if (!res.ok) throw new Error('Erreur ' + res.status);
+      return res.blob();
+    }).then(function (blob) {
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'license_server_backup.db';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+    }).catch(function (err) {
+      showMsg('main-msg', err.message, true);
+    }).finally(function () {
+      btn.disabled = false; btn.textContent = '💾 Sauvegarder la base';
+    });
+  }
+
   // ── Délégation d'évènements (aucune valeur dynamique dans du HTML/JS
   // généré : clé, statut, formule circulent comme de vraies valeurs JS, pas
   // comme du texte réinterprété) ─────────────────────────────────────────
@@ -1778,13 +2113,23 @@ _ADMIN_MOBILE_HTML = """<!DOCTYPE html>
     if (act === 'activations') openActivations(key);
     else if (act === 'status') openStatus(key, btn.getAttribute('data-status'));
     else if (act === 'plan') openPlan(key, btn.getAttribute('data-plan'));
+    else if (act === 'history') openHistory(key);
+    else if (act === 'edit') openEdit(key, btn.getAttribute('data-customer'), btn.getAttribute('data-notes'));
+    else if (act === 'extend') openExtend(key);
     else if (act === 'delete') openDelete(key);
   });
   document.getElementById('overlay-root').addEventListener('click', function (ev) {
     if (ev.target.id === 'status-confirm-btn') confirmStatus();
     else if (ev.target.id === 'plan-quote-btn') quotePlan();
     else if (ev.target.id === 'plan-confirm-btn') confirmPlan();
+    else if (ev.target.id === 'edit-confirm-btn') confirmEdit();
+    else if (ev.target.id === 'extend-confirm-btn') confirmExtend();
     else if (ev.target.id === 'del-confirm-btn') confirmDelete();
+  });
+  document.getElementById('audit-log-btn').addEventListener('click', openAuditLog);
+  document.getElementById('backup-btn').addEventListener('click', downloadBackup);
+  document.getElementById('lic-search').addEventListener('input', function () {
+    renderLicenses(filterLicenses(allLicenses, this.value));
   });
 
   // ── Démarrage : reprise de session si un jeton est déjà en mémoire ────
@@ -1794,7 +2139,7 @@ _ADMIN_MOBILE_HTML = """<!DOCTYPE html>
     api('/admin/licenses').then(function (data) {
       document.getElementById('view-login').classList.add('hidden');
       document.getElementById('view-main').classList.remove('hidden');
-      renderLicenses(data.items || []);
+      applyLicenses(data.items);
     }).catch(function () { clearToken(); });
   }
 })();
