@@ -1433,6 +1433,7 @@ _ADMIN_MOBILE_HTML = """<!DOCTYPE html>
 
       <label for="f-plan">Formule</label>
       <select id="f-plan">
+        <option value="Démo">Démo</option>
         <option value="Basic">Basic</option>
         <option value="Pro" selected>Pro</option>
         <option value="Expert">Expert</option>
