@@ -1689,6 +1689,12 @@ def _issue_license_for_stripe_session(session_id: str) -> tuple[Optional[sqlite3
 
     plan_name = str(mapping.get("plan") or "").strip() or "Basic"
     days = int(mapping.get("days") or DEFAULT_LICENSE_DURATION_DAYS)
+    # « 1 licence / 1 poste » sur la page tarifaire : la vente en ligne doit
+    # donc créer 1 poste par défaut, pas le défaut serveur (2, pensé pour la
+    # création manuelle où Alex choisit lui-même). Réglable par forfait via
+    # STRIPE_PRICE_MAP (clé optionnelle "devices"), pour le jour où un forfait
+    # vendrait explicitement plusieurs postes.
+    devices = max(1, int(mapping.get("devices") or 1))
 
     customer_details = session.get("customer_details") or {}
     email = str(customer_details.get("email") or "").strip()
@@ -1719,7 +1725,7 @@ def _issue_license_for_stripe_session(session_id: str) -> tuple[Optional[sqlite3
                 DEFAULT_PRODUCT_CODE,
                 customer_name,
                 plan_name,
-                int(SETTINGS.get("default_max_devices") or DEFAULT_MAX_DEVICES),
+                devices,
                 int(SETTINGS.get("default_offline_grace_days") or DEFAULT_OFFLINE_GRACE_DAYS),
                 _iso(expires_at),
                 _iso(now),
