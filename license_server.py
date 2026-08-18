@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Form, Header, HTTPException
+from fastapi import FastAPI, Form, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
@@ -297,6 +297,19 @@ def _ensure_schema() -> None:
                     con.execute(f"ALTER TABLE rsvp_pending ADD COLUMN {col} {ddl}")
                 except Exception:
                     pass
+        # Achat automatisé (Stripe, 18/08/2026) : une ligne par session de
+        # paiement traitée, pour ne créer qu'une seule licence même si
+        # /buy/success et /buy/webhook arrivent tous les deux pour la même
+        # session (ou si Stripe réessaie son webhook).
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stripe_events (
+                session_id TEXT PRIMARY KEY,
+                license_key TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
 
 
 def _seed_demo_license() -> None:
@@ -1474,6 +1487,350 @@ def download_backup(x_api_token: str | None = Header(default=None)) -> FileRespo
         tmp_path, filename=filename, media_type="application/octet-stream",
         background=BackgroundTask(lambda: os.unlink(tmp_path) if os.path.exists(tmp_path) else None),
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Achat automatisé (Stripe) — 18/08/2026
+#
+# Objectif : qu'un client puisse payer et recevoir sa clé de licence SANS
+# passer par un e-mail manuel. Le paiement lui-même est entièrement géré par
+# Stripe (Payment Links) — ce serveur ne voit ni ne stocke jamais de moyen de
+# paiement, seulement la confirmation que Stripe a été payé.
+#
+# Fonctionnement :
+#   1. Alex crée dans son tableau de bord Stripe un Prix par forfait (Basic,
+#      Pro, Expert) et un « Payment Link » par prix, avec pour URL de succès
+#      "<url-du-serveur>/buy/success?session_id={CHECKOUT_SESSION_ID}".
+#   2. Le logiciel client (bouton « Payer maintenant ») ouvre ce lien dans le
+#      navigateur — récupéré via GET /buy/links, pour ne pas être à coder en
+#      dur côté logiciel si Alex change ses liens.
+#   3. Une fois le paiement effectué, Stripe redirige le navigateur du client
+#      vers /buy/success, qui crée la licence et l'affiche immédiatement.
+#   4. En parallèle (et en secours si le client ferme l'onglet avant la
+#      redirection), Stripe appelle aussi /buy/webhook — même logique de
+#      création, protégée par vérification de signature et rendue idempotente
+#      (une seule licence par session Stripe, quel que soit le nombre
+#      d'appels, quel que soit celui des deux qui arrive en premier).
+#
+# Configuration (variables d'environnement Render, JAMAIS écrites ici) :
+#   STRIPE_SECRET_KEY      clé secrète Stripe (tableau de bord → Développeurs
+#                          → Clés API). Sert à interroger l'API Stripe pour
+#                          confirmer un paiement.
+#   STRIPE_WEBHOOK_SECRET  secret de signature du point de terminaison webhook
+#                          (tableau de bord → Développeurs → Webhooks → créer
+#                          un point de terminaison vers <url-serveur>/buy/webhook,
+#                          événements "checkout.session.completed" et
+#                          "checkout.session.async_payment_succeeded").
+#   STRIPE_PRICE_MAP       JSON associant un id de Prix Stripe (price_xxx) au
+#                          forfait et à la durée à créer, ex. :
+#                          {"price_ABC": {"plan": "Basic", "days": 365},
+#                           "price_DEF": {"plan": "Pro",   "days": 365},
+#                           "price_GHI": {"plan": "Expert","days": 365}}
+#   PAYMENT_LINKS          JSON associant un forfait à son Payment Link
+#                          public, ex. {"basic": "https://buy.stripe.com/xxx",
+#                          "pro": "...", "expert": "..."} — exposé tel quel
+#                          par GET /buy/links (pages de paiement publiques,
+#                          pas des secrets).
+#   SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASSWORD / SMTP_FROM (optionnels)
+#                          si renseignés, la clé est en plus envoyée par
+#                          e-mail au client (elle reste de toute façon
+#                          affichée sur /buy/success même sans SMTP).
+#
+# Tant que STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET ne sont pas configurés,
+# ces endpoints répondent 503 sans jamais affecter le reste du serveur —
+# l'achat automatisé est un AJOUT, pas un remplacement du circuit manuel
+# existant (/admin/licenses reste utilisable exactement comme avant).
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _StripeNotConfigured(Exception):
+    pass
+
+
+def _stripe_secret_key() -> str:
+    return _normalize_token(os.getenv("STRIPE_SECRET_KEY"))
+
+
+def _stripe_webhook_secret() -> str:
+    return _normalize_token(os.getenv("STRIPE_WEBHOOK_SECRET"))
+
+
+def _stripe_price_map() -> dict[str, Any]:
+    raw = os.getenv("STRIPE_PRICE_MAP") or ""
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _payment_links() -> dict[str, str]:
+    raw = os.getenv("PAYMENT_LINKS") or ""
+    try:
+        data = json.loads(raw) if raw.strip() else {}
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _stripe_api_get(path: str) -> dict[str, Any]:
+    """Appel GET minimal à l'API Stripe, sans dépendance au SDK officiel —
+    une poignée d'appels ne justifient pas d'ajouter une bibliothèque au
+    déploiement."""
+    import urllib.request
+    import urllib.error
+
+    key = _stripe_secret_key()
+    if not key:
+        raise _StripeNotConfigured("STRIPE_SECRET_KEY non configuré côté serveur.")
+    url = f"https://api.stripe.com/v1/{path}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"Réponse Stripe inattendue : {detail}") from exc
+
+
+def _verify_stripe_signature(payload: bytes, sig_header: str, secret: str) -> bool:
+    """Vérification manuelle de la signature webhook Stripe (schéma documenté
+    par Stripe : en-tête "t=<horodatage>,v1=<hmac>", comparaison en temps
+    constant) — évite d'ajouter le SDK Stripe au déploiement pour cette seule
+    fonction."""
+    import hmac as _hmac
+
+    try:
+        parts = dict(
+            item.split("=", 1) for item in str(sig_header or "").split(",") if "=" in item
+        )
+        timestamp = parts.get("t", "")
+        signature = parts.get("v1", "")
+        if not timestamp or not signature:
+            return False
+        signed_payload = f"{timestamp}.".encode("utf-8") + payload
+        expected = _hmac.new(secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
+        return _hmac.compare_digest(expected, signature)
+    except Exception:
+        return False
+
+
+def _maybe_send_license_email(to_email: str, license_key: str, plan_name: str, expires_at: str) -> None:
+    """Best-effort : n'envoie rien si SMTP_HOST n'est pas configuré, et ne
+    lève jamais — la clé reste de toute façon affichée sur /buy/success."""
+    host = _normalize_token(os.getenv("SMTP_HOST"))
+    if not host or not to_email:
+        return
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+
+        port = int(os.getenv("SMTP_PORT") or 587)
+        user = _normalize_token(os.getenv("SMTP_USER"))
+        password = os.getenv("SMTP_PASSWORD") or ""
+        sender = _normalize_token(os.getenv("SMTP_FROM")) or user or "no-reply@eventmanagerpro"
+
+        body = (
+            f"Merci pour votre achat d'Event Manager Pro — forfait {plan_name}.\n\n"
+            f"Votre clé de licence : {license_key}\n"
+            f"Valable jusqu'au : {expires_at[:10]}\n\n"
+            "Pour l'activer : ouvrez Event Manager Pro, rubrique Licence, "
+            "« J'ai une licence », puis collez cette clé.\n"
+        )
+        msg = MIMEText(body, _charset="utf-8")
+        msg["Subject"] = "Votre licence Event Manager Pro"
+        msg["From"] = sender
+        msg["To"] = to_email
+
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=15) as server:
+                if user:
+                    server.login(user, password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=15) as server:
+                server.starttls()
+                if user:
+                    server.login(user, password)
+                server.send_message(msg)
+    except Exception:
+        pass  # l'e-mail est un plus, jamais un blocage
+
+
+def _issue_license_for_stripe_session(session_id: str) -> tuple[Optional[sqlite3.Row], str]:
+    """Crée (ou retrouve, si déjà traitée) la licence correspondant à une
+    session Stripe payée. Idempotent : appelable sans risque à la fois depuis
+    /buy/success (dès le retour du navigateur) et /buy/webhook (en secours),
+    quel que soit celui des deux qui arrive en premier.
+
+    Retourne (ligne de licence ou None, message d'erreur ou "")."""
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return None, "Session de paiement manquante."
+
+    with _db() as con:
+        existing = con.execute(
+            "SELECT license_key FROM stripe_events WHERE session_id=?", (session_id,)
+        ).fetchone()
+        if existing is not None:
+            return _get_license_row(con, str(existing["license_key"])), ""
+
+    session = _stripe_api_get(f"checkout/sessions/{session_id}?expand[]=line_items")
+    if str(session.get("payment_status") or "") != "paid":
+        return None, "Paiement pas encore confirmé — réessaie dans quelques instants."
+
+    line_items = ((session.get("line_items") or {}).get("data") or [])
+    price_id = ""
+    if line_items:
+        price_id = str(((line_items[0] or {}).get("price") or {}).get("id") or "")
+    mapping = _stripe_price_map().get(price_id)
+    if not mapping:
+        _log_event("stripe_unknown_price", details={"session_id": session_id, "price_id": price_id})
+        return None, "Forfait non reconnu pour ce paiement — contacte le support avec ta référence de paiement."
+
+    plan_name = str(mapping.get("plan") or "").strip() or "Basic"
+    days = int(mapping.get("days") or DEFAULT_LICENSE_DURATION_DAYS)
+
+    customer_details = session.get("customer_details") or {}
+    email = str(customer_details.get("email") or "").strip()
+    customer_name = str(customer_details.get("name") or "").strip() or email or "Client (achat en ligne)"
+
+    now = _utc_now()
+    expires_at = now + timedelta(days=days)
+    license_key = _random_license_key()
+
+    with _db() as con:
+        # Revérifié SOUS l'écriture : deux appels concurrents (retour
+        # navigateur + webhook arrivant en même temps) ne doivent créer
+        # qu'UNE seule licence pour la même session.
+        existing = con.execute(
+            "SELECT license_key FROM stripe_events WHERE session_id=?", (session_id,)
+        ).fetchone()
+        if existing is not None:
+            return _get_license_row(con, str(existing["license_key"])), ""
+        con.execute(
+            """
+            INSERT INTO licenses(
+                license_key, product_code, customer_name, plan_name, status,
+                max_devices, offline_grace_days, expires_at, created_at, updated_at, notes
+            ) VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                license_key,
+                DEFAULT_PRODUCT_CODE,
+                customer_name,
+                plan_name,
+                int(SETTINGS.get("default_max_devices") or DEFAULT_MAX_DEVICES),
+                int(SETTINGS.get("default_offline_grace_days") or DEFAULT_OFFLINE_GRACE_DAYS),
+                _iso(expires_at),
+                _iso(now),
+                _iso(now),
+                f"Achat automatique en ligne (Stripe) — session {session_id}"
+                + (f" — {email}" if email else ""),
+            ),
+        )
+        con.execute(
+            "INSERT INTO stripe_events(session_id, license_key, created_at) VALUES (?, ?, ?)",
+            (session_id, license_key, _iso(now)),
+        )
+        row = _get_license_row(con, license_key)
+        _log_event(
+            "stripe_purchase", license_key=license_key,
+            details={"session_id": session_id, "plan": plan_name, "email": email},
+            con=con,
+        )
+
+    _maybe_send_license_email(email, license_key, plan_name, _iso(expires_at))
+    return row, ""
+
+
+def _buy_page(title: str, body_html: str, refresh: bool = False) -> str:
+    meta = '<meta http-equiv="refresh" content="5">' if refresh else ""
+    return f"""<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
+{meta}
+<title>{_html.escape(title)}</title>
+<style>
+    body {{ font-family: -apple-system, "Segoe UI", sans-serif; background:#0f1420; color:#f4f7fb;
+            display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; }}
+    .card {{ background:#1b2233; border:1px solid #2c3445; border-radius:14px; padding:32px;
+             max-width:480px; text-align:center; }}
+    h1 {{ font-size:20px; margin-top:0; }}
+    .key-box {{ font-family: monospace; font-size:20px; letter-spacing:1px; background:#0f1420;
+                border:1px dashed #7c4dcc; border-radius:8px; padding:14px; margin:16px 0; user-select:all; }}
+    button {{ background:#7c4dcc; color:white; border:none; border-radius:8px; padding:10px 18px;
+              font-weight:700; cursor:pointer; }}
+</style></head><body><div class="card"><h1>{_html.escape(title)}</h1>{body_html}</div></body></html>"""
+
+
+@app.get("/buy/links")
+def get_payment_links() -> dict[str, Any]:
+    """Liste des pages de paiement configurées, par forfait. Public et sans
+    jeton : ce sont des liens de paiement publics (n'importe qui peut de
+    toute façon les trouver en cliquant « Acheter » dans le logiciel), pas
+    des informations sensibles."""
+    return {"links": _payment_links()}
+
+
+@app.get("/buy/success", response_class=HTMLResponse)
+def buy_success(session_id: str = "") -> HTMLResponse:
+    try:
+        row, error = _issue_license_for_stripe_session(session_id)
+    except _StripeNotConfigured as exc:
+        return HTMLResponse(_buy_page("Achat automatisé non configuré", str(exc)), status_code=503)
+    except HTTPException as exc:
+        return HTMLResponse(_buy_page("Erreur", str(exc.detail)), status_code=exc.status_code)
+
+    if row is None:
+        return HTMLResponse(_buy_page(
+            "Paiement en cours de confirmation",
+            f"<p>{_html.escape(error or 'Merci de patienter quelques instants…')}</p>"
+            "<p>Cette page se rafraîchit toute seule.</p>",
+            refresh=True,
+        ))
+
+    key = str(row["license_key"])
+    return HTMLResponse(_buy_page(
+        "Merci pour votre achat !",
+        f"""
+        <p>Votre forfait <b>{_html.escape(str(row['plan_name']))}</b> est prêt.</p>
+        <div class="key-box">{_html.escape(key)}</div>
+        <button onclick="navigator.clipboard.writeText('{key}')">📋 Copier la clé</button>
+        <p style="margin-top:18px;">Valable jusqu'au {_html.escape(str(row['expires_at'])[:10])}.</p>
+        <p>Pour l'activer : ouvre <b>Event Manager Pro</b> → Licence →
+        « J'ai une licence » → colle cette clé.</p>
+        """,
+    ))
+
+
+@app.post("/buy/webhook")
+async def stripe_webhook(request: Request) -> dict[str, Any]:
+    secret = _stripe_webhook_secret()
+    if not secret:
+        raise HTTPException(status_code=503, detail="STRIPE_WEBHOOK_SECRET non configuré côté serveur.")
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature") or ""
+    if not _verify_stripe_signature(payload, sig_header, secret):
+        raise HTTPException(status_code=400, detail="Signature webhook invalide.")
+
+    try:
+        event = json.loads(payload.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Corps de requête illisible.")
+
+    event_type = str(event.get("type") or "")
+    if event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
+        session_obj = ((event.get("data") or {}).get("object") or {})
+        session_id = str(session_obj.get("id") or "")
+        if session_id:
+            try:
+                _issue_license_for_stripe_session(session_id)
+            except Exception:
+                # Ne jamais faire échouer le webhook : Stripe réessaierait en
+                # boucle. Les échecs restent consultables via
+                # /admin/audit-log (evénement "stripe_unknown_price") ou dans
+                # les journaux Render.
+                pass
+
+    return {"received": True}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
