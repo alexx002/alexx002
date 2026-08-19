@@ -27,6 +27,12 @@ DEFAULT_API_TOKEN = "CHANGE_ME"
 ENV_API_TOKEN_NAME = "LICENSE_SERVER_API_TOKEN"
 DEFAULT_MAX_DEVICES = 2
 DEFAULT_LICENSE_DURATION_DAYS = 365
+# Essai gratuit en libre-service (19/08/2026) : durée volontairement très
+# longue. Le forfait Démo est le palier PERMANENT et gratuit de l'offre
+# (voir core/entitlements.py : 5 invités max, 1 ligne par module...), pas
+# un essai à échéance courte — ses vraies limites sont déjà appliquées côté
+# logiciel, inutile de gérer une échéance serveur courte en plus.
+DEMO_CLAIM_DURATION_DAYS = 3650
 
 # ── Plans, du plus bas au plus haut ─────────────────────────────────────────
 # ⚠️ DOIT RESTER SYNCHRONISÉ avec EVENT_manager/core/entitlements.py
@@ -585,6 +591,20 @@ class DeactivationRequest(BaseModel):
     activation_id: str = Field(default="")
 
 
+class DemoClaimRequest(BaseModel):
+    """Essai gratuit en libre-service (19/08/2026) : contrairement à
+    ActivationRequest/ValidationRequest, aucune `license_key` — il n'y en a
+    pas encore, c'est justement ce que cet appel délivre."""
+    product_code: str = Field(default=DEFAULT_PRODUCT_CODE)
+    app_name: str = Field(default=DEFAULT_PRODUCT_CODE)
+    app_version: str = Field(default="1.0.0")
+    machine_id: str
+    machine_name: str = Field(default="")
+    platform: str = Field(default="")
+    platform_release: str = Field(default="")
+    hostname: str = Field(default="")
+
+
 class CreateLicenseRequest(BaseModel):
     customer_name: str = Field(default="")
     plan_name: str = Field(default="Pro")
@@ -965,6 +985,129 @@ def deactivate(payload: DeactivationRequest) -> dict[str, Any]:
             "used_devices": used_devices,
             "max_devices": int(license_row["max_devices"] or 0),
         }
+
+
+@app.post("/license/demo-claim")
+def claim_demo_license(payload: DemoClaimRequest) -> dict[str, Any]:
+    """Essai gratuit en libre-service (19/08/2026, demande d'Alex :
+    « il faut pouvoir le faire de maintenant »). Contrairement à TOUS les
+    autres forfaits — payants via Stripe (paiement d'abord, webhook délivre
+    ensuite), ou activés manuellement par Alex (`POST /admin/licenses`,
+    jeton admin requis) — le forfait Démo est délivré ET activé
+    INSTANTANÉMENT ici, sans jeton ni paiement : c'est le palier gratuit
+    permanent de l'offre, rien à facturer ni à vérifier humainement.
+
+    Idempotent par poste : si ce poste a déjà une licence active (démo ou
+    autre — activation trouvée par `machine_hash`, même fingerprint que
+    /activate et /validate), on renvoie CELLE-LÀ plutôt que d'en créer une
+    seconde. Un double-clic sur le bouton, ou un relancement après coupure
+    réseau, n'empile donc jamais plusieurs licences démo pour le même
+    poste — et un poste qui a déjà une licence payante active n'en reçoit
+    pas une démo en plus par erreur."""
+    if _normalize_license_key(payload.product_code) != _normalize_license_key(
+            str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE)):
+        raise HTTPException(status_code=400, detail="product_code invalide.")
+
+    machine_hash = _machine_fingerprint(payload.machine_id)
+    now = _utc_now()
+
+    with _db() as con:
+        existing_activation = con.execute(
+            "SELECT * FROM activations WHERE machine_hash=? AND status='active' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (machine_hash,),
+        ).fetchone()
+        if existing_activation is not None:
+            existing_license = con.execute(
+                "SELECT * FROM licenses WHERE id=?",
+                (int(existing_activation["license_id"]),),
+            ).fetchone()
+            if existing_license is not None and _license_status_error(existing_license) is None:
+                used_devices = _count_active_activations(con, int(existing_license["id"]))
+                next_check_at = now + timedelta(
+                    days=int(existing_license["offline_grace_days"] or DEFAULT_OFFLINE_GRACE_DAYS))
+                _log_event(
+                    "demo_claim_existing",
+                    license_key=str(existing_license["license_key"]),
+                    activation_id=str(existing_activation["activation_id"]),
+                    machine_hash=machine_hash,
+                    con=con,
+                )
+                return _row_to_license_payload(
+                    existing_license,
+                    activation_id=str(existing_activation["activation_id"]),
+                    used_devices=used_devices,
+                    validated_at=now,
+                    next_check_at=next_check_at,
+                    message="Une licence est déjà active sur ce poste.",
+                )
+
+        license_key = _random_license_key()
+        expires_at = now + timedelta(days=DEMO_CLAIM_DURATION_DAYS)
+        con.execute(
+            """
+            INSERT INTO licenses(
+                license_key, product_code, customer_name, plan_name, status,
+                max_devices, offline_grace_days, expires_at, created_at, updated_at, notes
+            ) VALUES (?, ?, '', 'demo', 'active', ?, ?, ?, ?, ?, ?)
+            """
+            ,
+            (
+                license_key,
+                _normalize_license_key(payload.product_code) or DEFAULT_PRODUCT_CODE,
+                DEFAULT_MAX_DEVICES,
+                DEFAULT_OFFLINE_GRACE_DAYS,
+                _iso(expires_at),
+                _iso(now),
+                _iso(now),
+                "Essai gratuit auto-délivré (self-service, /license/demo-claim).",
+            ),
+        )
+        license_row = _get_license_row(con, license_key)
+
+        activation_id = _random_activation_id()
+        con.execute(
+            """
+            INSERT INTO activations(
+                activation_id, license_id, machine_hash, machine_id, machine_name, hostname,
+                platform, platform_release, app_name, app_version, status,
+                created_at, last_validated_at, last_ip
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, '')
+            """
+            ,
+            (
+                activation_id,
+                int(license_row["id"]),
+                machine_hash,
+                payload.machine_id.strip(),
+                payload.machine_name.strip(),
+                payload.hostname.strip(),
+                payload.platform.strip(),
+                payload.platform_release.strip(),
+                payload.app_name.strip(),
+                payload.app_version.strip(),
+                _iso(now),
+                _iso(now),
+            ),
+        )
+        used_devices = _count_active_activations(con, int(license_row["id"]))
+        next_check_at = now + timedelta(
+            days=int(license_row["offline_grace_days"] or DEFAULT_OFFLINE_GRACE_DAYS))
+        _log_event(
+            "demo_claim_issued",
+            license_key=license_key,
+            activation_id=activation_id,
+            machine_hash=machine_hash,
+            con=con,
+        )
+        return _row_to_license_payload(
+            license_row,
+            activation_id=activation_id,
+            used_devices=used_devices,
+            validated_at=now,
+            next_check_at=next_check_at,
+            message="Essai gratuit activé.",
+        )
 
 
 @app.post("/admin/licenses")
