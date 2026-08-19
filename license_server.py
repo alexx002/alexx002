@@ -51,9 +51,11 @@ def normalize_plan(value: str | None) -> str:
     return p if p in PLAN_ORDER else "demo"
 
 
-# Tarifs annuels par plan, en euros. Servent UNIQUEMENT à proposer un montant
-# au prorata lors d'une mise à niveau — le serveur n'encaisse rien. Modifiables
-# sans redéploiement via data/license_server_settings.json (clé "plan_prices").
+# Tarifs annuels par plan, en euros. Servent UNIQUEMENT à calculer la
+# différence de tarif lors d'une mise à niveau (montant fixe, pas de prorata
+# du temps restant — décision d'Alex) — le serveur n'encaisse rien lui-même.
+# Modifiables sans redéploiement via data/license_server_settings.json
+# (clé "plan_prices").
 DEFAULT_PLAN_PRICES = {"demo": 0.0, "basic": 29.0, "pro": 49.0, "expert": 79.0}
 
 
@@ -218,7 +220,7 @@ def _ensure_schema() -> None:
         )
         # Historique des mises à niveau : utile en comptabilité et en cas de
         # contestation (quand, de quel plan vers quel plan, combien de jours
-        # restaient, et quel montant a été facturé au prorata).
+        # restaient à titre indicatif, et quel montant fixe a été facturé).
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS plan_changes (
@@ -304,6 +306,20 @@ def _ensure_schema() -> None:
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS stripe_events (
+                session_id TEXT PRIMARY KEY,
+                license_key TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        # Mise à niveau payée en ligne (Stripe, 19/08/2026) : même principe
+        # d'idempotence que stripe_events ci-dessus, mais pour une mise à
+        # niveau de licence EXISTANTE (pas une création) — table séparée pour
+        # ne pas mélanger « une licence a été créée pour cette session » et
+        # « une licence existante a été mise à niveau pour cette session ».
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stripe_upgrade_events (
                 session_id TEXT PRIMARY KEY,
                 license_key TEXT NOT NULL,
                 created_at TEXT NOT NULL
@@ -606,12 +622,26 @@ class ExtendLicenseRequest(BaseModel):
 class UpgradePlanRequest(BaseModel):
     """Mise à niveau d'une licence existante vers un plan SUPÉRIEUR."""
     plan_name: str
-    # Montant réellement encaissé (au prorata), pour l'historique. Texte libre :
-    # le serveur ne fait pas de comptabilité, il conserve la trace.
+    # Montant réellement encaissé (montant fixe, différence de tarif), pour
+    # l'historique. Texte libre : le serveur ne fait pas de comptabilité, il
+    # conserve la trace.
     amount_charged: str = Field(default="")
     notes: str = Field(default="")
     # Durée appliquée UNIQUEMENT lors d'une sortie de démo (voir endpoint).
     duration_days: int = Field(default=DEFAULT_LICENSE_DURATION_DAYS, ge=1, le=3650)
+
+
+class UpgradeCheckoutRequest(BaseModel):
+    """Demande de paiement en ligne d'une mise à niveau, envoyée par le
+    logiciel client. Identifie la licence par activation_id — jamais par la
+    clé en clair, même logique que /validate (voir
+    _license_row_from_activation) : le montant à payer est TOUJOURS
+    recalculé côté serveur à partir de la licence réelle, jamais accepté tel
+    quel depuis le client."""
+    product_code: str = Field(default=DEFAULT_PRODUCT_CODE)
+    activation_id: str = Field(default="")
+    machine_id: str = Field(default="")
+    plan_name: str
 
 
 class RsvpRegisterRequest(BaseModel):
@@ -1072,10 +1102,10 @@ def _check_upgrade_allowed(old_plan: str, new_plan: str) -> None:
 
 def _compute_upgrade(row: sqlite3.Row, new_plan: str, duration_days: int,
                      now: datetime) -> dict[str, Any]:
-    """Calcule le montant au prorata et la date d'expiration résultante,
-    SANS RIEN MODIFIER. Utilisé tel quel par le devis (lecture seule) et par
-    l'application, pour que le montant annoncé avant paiement soit exactement
-    celui appliqué ensuite."""
+    """Calcule le montant à facturer (FIXE, voir plus bas) et la date
+    d'expiration résultante, SANS RIEN MODIFIER. Utilisé tel quel par le
+    devis (lecture seule) et par l'application, pour que le montant annoncé
+    avant paiement soit exactement celui appliqué ensuite."""
     old_plan = normalize_plan(row["plan_name"])
     expires_before = _parse_iso(row["expires_at"])
     days_remaining = max(0, (expires_before - now).days) if expires_before else 0
@@ -1096,11 +1126,16 @@ def _compute_upgrade(row: sqlite3.Row, new_plan: str, duration_days: int,
     if not total_days:
         total_days = DEFAULT_LICENSE_DURATION_DAYS
 
+    # Montant FIXE (décision d'Alex, 19/08/2026) : la différence de tarif
+    # entre les deux forfaits, SANS prorata du temps restant — un client qui
+    # passe de Basic à Pro paie 20 € (49 − 29), qu'il lui reste 3 jours ou
+    # 300 jours sur sa période en cours. days_remaining/total_days restent
+    # calculés ci-dessus et renvoyés ci-dessous à titre indicatif seulement
+    # (affichage, historique plan_changes) : ils n'entrent plus dans le prix.
     if old_plan == "demo":
-        suggested = plan_price(new_plan)          # plein tarif
+        suggested = plan_price(new_plan)          # plein tarif, sortie de démo
     else:
-        diff = max(0.0, plan_price(new_plan) - plan_price(old_plan))
-        suggested = round(diff * days_remaining / total_days, 2)
+        suggested = round(max(0.0, plan_price(new_plan) - plan_price(old_plan)), 2)
 
     return {
         "old_plan": old_plan,
@@ -1117,6 +1152,65 @@ def _compute_upgrade(row: sqlite3.Row, new_plan: str, duration_days: int,
         "_expires_before": expires_before,
         "_expires_after": expires_after,
     }
+
+
+def _apply_plan_upgrade(
+    con: sqlite3.Connection,
+    row: sqlite3.Row,
+    new_plan: str,
+    duration_days: int,
+    now: datetime,
+    amount_charged: str = "",
+    notes: str = "",
+    event_type: str = "admin_upgrade_plan",
+) -> dict[str, Any]:
+    """Applique un changement de plan déjà validé par _check_upgrade_allowed
+    (à l'appelant de l'avoir vérifié juste avant) : recalcule via
+    _compute_upgrade (même calcul EXACT que le devis affiché), écrit la
+    licence et l'historique plan_changes, journalise. Partagé par
+    l'application manuelle (PATCH .../plan, outil d'administration) et la
+    mise à niveau payée en ligne (Stripe, voir /upgrade/success et le
+    webhook) — un seul endroit qui modifie réellement une licence pour une
+    mise à niveau, pour que les deux circuits restent identiques."""
+    old_plan = normalize_plan(row["plan_name"])
+    calc = _compute_upgrade(row, new_plan, int(duration_days), now)
+    expires_before = calc["_expires_before"]
+    expires_after = calc["_expires_after"]
+    days_remaining = calc["days_remaining"]
+
+    con.execute(
+        "UPDATE licenses SET plan_name=?, expires_at=?, updated_at=? WHERE id=?",
+        (new_plan, _iso(expires_after) if expires_after else "", _iso(now), int(row["id"])),
+    )
+    con.execute(
+        """
+        INSERT INTO plan_changes(license_key, old_plan, new_plan, days_remaining,
+                                 expires_at_before, expires_at_after,
+                                 amount_charged, notes, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            _normalize_license_key(str(row["license_key"])), old_plan, new_plan, int(days_remaining),
+            _iso(expires_before) if expires_before else "",
+            _iso(expires_after) if expires_after else "",
+            str(amount_charged or "").strip(),
+            str(notes or "").strip(),
+            _iso(now),
+        ),
+    )
+    _log_event(
+        event_type,
+        license_key=_normalize_license_key(str(row["license_key"])),
+        details={
+            "old_plan": old_plan, "new_plan": new_plan,
+            "days_remaining": days_remaining,
+            "expiry_reset": bool(old_plan == "demo"),
+            "suggested_amount": calc["suggested_amount"],
+            "amount_charged": str(amount_charged or "").strip(),
+        },
+        con=con,
+    )
+    return calc
 
 
 @app.get("/admin/licenses/{license_key}/upgrade-quote")
@@ -1188,44 +1282,11 @@ def upgrade_license_plan(
 
         _check_upgrade_allowed(old_plan, new_plan)
 
-        calc = _compute_upgrade(row, new_plan, int(payload.duration_days), now)
-        expires_before = calc["_expires_before"]
-        expires_after = calc["_expires_after"]
-        days_remaining = calc["days_remaining"]
-        total_days = calc["total_days"]
-        suggested = calc["suggested_amount"]
-
-        con.execute(
-            "UPDATE licenses SET plan_name=?, expires_at=?, updated_at=? WHERE id=?",
-            (new_plan, _iso(expires_after) if expires_after else "", _iso(now), int(row["id"])),
-        )
-        con.execute(
-            """
-            INSERT INTO plan_changes(license_key, old_plan, new_plan, days_remaining,
-                                     expires_at_before, expires_at_after,
-                                     amount_charged, notes, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                _normalize_license_key(license_key), old_plan, new_plan, int(days_remaining),
-                _iso(expires_before) if expires_before else "",
-                _iso(expires_after) if expires_after else "",
-                str(payload.amount_charged or "").strip(),
-                str(payload.notes or "").strip(),
-                _iso(now),
-            ),
-        )
-        _log_event(
-            "admin_upgrade_plan",
-            license_key=_normalize_license_key(license_key),
-            details={
-                "old_plan": old_plan, "new_plan": new_plan,
-                "days_remaining": days_remaining,
-                "expiry_reset": bool(old_plan == "demo"),
-                "suggested_amount": suggested,
-                "amount_charged": str(payload.amount_charged or "").strip(),
-            },
-            con=con,
+        calc = _apply_plan_upgrade(
+            con, row, new_plan, int(payload.duration_days), now,
+            amount_charged=str(payload.amount_charged or "").strip(),
+            notes=str(payload.notes or "").strip(),
+            event_type="admin_upgrade_plan",
         )
 
         updated = _get_license_row(con, license_key)
@@ -1592,6 +1653,51 @@ def _stripe_api_get(path: str) -> dict[str, Any]:
         raise HTTPException(status_code=502, detail=f"Réponse Stripe inattendue : {detail}") from exc
 
 
+def _stripe_flatten_params(prefix: str, value: Any, out: list[tuple[str, str]]) -> None:
+    """Convertit un dict Python en paramètres de formulaire imbriqués comme
+    l'attend l'API Stripe (ex. line_items[0][price_data][unit_amount]) —
+    évite d'ajouter le SDK Stripe au déploiement pour ce seul besoin."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _stripe_flatten_params(f"{prefix}[{k}]" if prefix else str(k), v, out)
+    elif isinstance(value, (list, tuple)):
+        for i, v in enumerate(value):
+            _stripe_flatten_params(f"{prefix}[{i}]", v, out)
+    elif value is not None:
+        out.append((prefix, str(value)))
+
+
+def _stripe_api_post(path: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Appel POST minimal à l'API Stripe (formulaire url-encodé, comme
+    l'exige l'API Stripe), sans dépendance au SDK officiel — même choix que
+    _stripe_api_get."""
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    key = _stripe_secret_key()
+    if not key:
+        raise _StripeNotConfigured("STRIPE_SECRET_KEY non configuré côté serveur.")
+    flat: list[tuple[str, str]] = []
+    for k, v in params.items():
+        _stripe_flatten_params(k, v, flat)
+    body = urllib.parse.urlencode(flat).encode("utf-8")
+    url = f"https://api.stripe.com/v1/{path}"
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"Réponse Stripe inattendue : {detail}") from exc
+
+
 def _verify_stripe_signature(payload: bytes, sig_header: str, secret: str) -> bool:
     """Vérification manuelle de la signature webhook Stripe (schéma documenté
     par Stripe : en-tête "t=<horodatage>,v1=<hmac>", comparaison en temps
@@ -1749,6 +1855,79 @@ def _issue_license_for_stripe_session(session_id: str) -> tuple[Optional[sqlite3
     return row, ""
 
 
+def _apply_stripe_upgrade_session(session_id: str) -> tuple[Optional[sqlite3.Row], str]:
+    """Applique la mise à niveau correspondant à une session Stripe payée.
+    Idempotent comme _issue_license_for_stripe_session ci-dessus (même
+    principe, table dédiée stripe_upgrade_events) : /upgrade/success (retour
+    navigateur) et le webhook peuvent l'appeler tous les deux pour la même
+    session, dans n'importe quel ordre, sans jamais facturer ni appliquer
+    deux fois.
+
+    Le plan cible et la licence concernée viennent des MÉTADONNÉES de la
+    session Stripe (posées par le serveur lui-même à la création, jamais
+    fournies par le client à cet endpoint) — la même prudence que pour
+    STRIPE_PRICE_MAP côté achat initial : on ne fait jamais confiance à une
+    valeur reçue après coup pour décider quoi appliquer."""
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return None, "Session de paiement manquante."
+
+    with _db() as con:
+        existing = con.execute(
+            "SELECT license_key FROM stripe_upgrade_events WHERE session_id=?", (session_id,)
+        ).fetchone()
+        if existing is not None:
+            return _get_license_row(con, str(existing["license_key"])), ""
+
+    session = _stripe_api_get(f"checkout/sessions/{session_id}")
+    if str(session.get("payment_status") or "") != "paid":
+        return None, "Paiement pas encore confirmé — réessaie dans quelques instants."
+
+    metadata = session.get("metadata") or {}
+    if str(metadata.get("kind") or "") != "upgrade":
+        return None, "Cette session ne correspond pas à une mise à niveau."
+    license_key = _normalize_license_key(str(metadata.get("license_key") or ""))
+    new_plan = normalize_plan(str(metadata.get("new_plan") or ""))
+    if not license_key or new_plan not in PLAN_ORDER:
+        _log_event("stripe_upgrade_bad_metadata", details={"session_id": session_id})
+        return None, "Référence de mise à niveau incomplète — contacte le support."
+
+    amount_paid = float(int(session.get("amount_total") or 0)) / 100.0
+    now = _utc_now()
+
+    with _db() as con:
+        existing = con.execute(
+            "SELECT license_key FROM stripe_upgrade_events WHERE session_id=?", (session_id,)
+        ).fetchone()
+        if existing is not None:
+            return _get_license_row(con, str(existing["license_key"])), ""
+
+        row = _get_license_row(con, license_key)
+        old_plan = normalize_plan(row["plan_name"])
+        if plan_rank(new_plan) <= plan_rank(old_plan):
+            # Déjà mise à niveau entretemps par un autre chemin (admin, ou
+            # /upgrade/success et le webhook arrivés dans l'autre ordre) —
+            # on considère l'opération faite, pas d'erreur pour un client qui
+            # vient de payer avec succès.
+            con.execute(
+                "INSERT OR IGNORE INTO stripe_upgrade_events(session_id, license_key, created_at) VALUES (?, ?, ?)",
+                (session_id, license_key, _iso(now)),
+            )
+            return _get_license_row(con, license_key), ""
+
+        _apply_plan_upgrade(
+            con, row, new_plan, DEFAULT_LICENSE_DURATION_DAYS, now,
+            amount_charged=f"{amount_paid:.2f} EUR (Stripe, session {session_id})",
+            notes="Mise à niveau payée en ligne (Stripe).",
+            event_type="stripe_upgrade",
+        )
+        con.execute(
+            "INSERT INTO stripe_upgrade_events(session_id, license_key, created_at) VALUES (?, ?, ?)",
+            (session_id, license_key, _iso(now)),
+        )
+        return _get_license_row(con, license_key), ""
+
+
 def _buy_page(title: str, body_html: str, refresh: bool = False) -> str:
     meta = '<meta http-equiv="refresh" content="5">' if refresh else ""
     return f"""<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8">
@@ -1807,6 +1986,111 @@ def buy_success(session_id: str = "") -> HTMLResponse:
     ))
 
 
+@app.post("/license/upgrade-checkout")
+def create_upgrade_checkout(payload: UpgradeCheckoutRequest, request: Request) -> dict[str, Any]:
+    """Crée une session de paiement Stripe pour le montant EXACT d'une mise
+    à niveau (montant fixe = différence de tarif entre les deux forfaits,
+    sans prorata du temps restant) — même calcul que
+    /admin/licenses/{clé}/upgrade-quote (_compute_upgrade), jamais un
+    montant fourni par le client. Renvoie
+    l'URL Stripe hébergée à ouvrir dans le navigateur (le logiciel client
+    fait ensuite la même chose qu'avec les boutons « Payer en ligne » du
+    comparatif des forfaits : QDesktopServices.openUrl). La mise à niveau
+    s'applique toute seule dès le paiement confirmé, voir /upgrade/success
+    et le webhook — pas besoin de repasser par license_admin_tool."""
+    if _normalize_license_key(payload.product_code) != _normalize_license_key(str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE)):
+        raise HTTPException(status_code=400, detail="product_code invalide.")
+    if str(payload.plan_name or "").strip().lower() not in PLAN_ALIASES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan inconnu : « {payload.plan_name} ». Attendu : {', '.join(PLAN_ORDER)}.",
+        )
+    new_plan = normalize_plan(payload.plan_name)
+    machine_hash = _machine_fingerprint(payload.machine_id)
+    now = _utc_now()
+
+    with _db() as con:
+        row = _license_row_from_activation(con, payload.activation_id, machine_hash)
+        license_key = _normalize_license_key(str(row["license_key"] or ""))
+        old_plan = normalize_plan(row["plan_name"])
+        _check_upgrade_allowed(old_plan, new_plan)
+        calc = _compute_upgrade(row, new_plan, DEFAULT_LICENSE_DURATION_DAYS, now)
+
+    amount = float(calc["suggested_amount"] or 0)
+    if amount <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Montant de mise à niveau nul ou négatif — contacte le support avec ta clé de licence.",
+        )
+
+    base_url = str(request.base_url).rstrip("/")
+    session = _stripe_api_post("checkout/sessions", {
+        "mode": "payment",
+        "line_items": [{
+            "quantity": 1,
+            "price_data": {
+                "currency": "eur",
+                "unit_amount": int(round(amount * 100)),
+                "product_data": {
+                    "name": f"Event Manager Pro — mise à niveau {old_plan.capitalize()} → {new_plan.capitalize()}",
+                },
+            },
+        }],
+        "success_url": f"{base_url}/upgrade/success?session_id={{CHECKOUT_SESSION_ID}}",
+        "cancel_url": f"{base_url}/buy/links",
+        "metadata": {
+            "kind": "upgrade",
+            "license_key": license_key,
+            "new_plan": new_plan,
+        },
+    })
+    checkout_url = str(session.get("url") or "")
+    if not checkout_url:
+        raise HTTPException(status_code=502, detail="Stripe n'a pas renvoyé d'URL de paiement.")
+
+    _log_event(
+        "stripe_upgrade_checkout_created",
+        license_key=license_key,
+        details={"old_plan": old_plan, "new_plan": new_plan, "amount": amount},
+    )
+    return {
+        "ok": True,
+        "checkout_url": checkout_url,
+        "amount": amount,
+        "old_plan": old_plan,
+        "new_plan": new_plan,
+    }
+
+
+@app.get("/upgrade/success", response_class=HTMLResponse)
+def upgrade_success(session_id: str = "") -> HTMLResponse:
+    try:
+        row, error = _apply_stripe_upgrade_session(session_id)
+    except _StripeNotConfigured as exc:
+        return HTMLResponse(_buy_page("Mise à niveau non configurée", str(exc)), status_code=503)
+    except HTTPException as exc:
+        return HTMLResponse(_buy_page("Erreur", str(exc.detail)), status_code=exc.status_code)
+
+    if row is None:
+        return HTMLResponse(_buy_page(
+            "Paiement en cours de confirmation",
+            f"<p>{_html.escape(error or 'Merci de patienter quelques instants…')}</p>"
+            "<p>Cette page se rafraîchit toute seule.</p>",
+            refresh=True,
+        ))
+
+    return HTMLResponse(_buy_page(
+        "Mise à niveau effectuée !",
+        f"""
+        <p>Ta licence est maintenant en <b>{_html.escape(str(row['plan_name']).capitalize())}</b>.</p>
+        <p style="margin-top:18px;">Toujours valable jusqu'au
+        {_html.escape(str(row['expires_at'])[:10])} — la date n'a pas changé.</p>
+        <p>Ouvre <b>Event Manager Pro</b> et clique « 🔄 Vérifier ma licence »
+        pour l'activer immédiatement.</p>
+        """,
+    ))
+
+
 @app.post("/buy/webhook")
 async def stripe_webhook(request: Request) -> dict[str, Any]:
     secret = _stripe_webhook_secret()
@@ -1826,9 +2110,19 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
     if event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
         session_obj = ((event.get("data") or {}).get("object") or {})
         session_id = str(session_obj.get("id") or "")
+        # Une session envoie ses métadonnées dans l'événement lui-même — pas
+        # besoin d'un deuxième point de terminaison webhook pour distinguer
+        # un ACHAT (nouvelle licence) d'une MISE À NIVEAU (licence existante,
+        # posé par le serveur à la création de la session, voir
+        # /license/upgrade-checkout) : Alex n'a rien à reconfigurer côté
+        # Stripe, le webhook déjà en place couvre les deux cas.
+        kind = str((session_obj.get("metadata") or {}).get("kind") or "")
         if session_id:
             try:
-                _issue_license_for_stripe_session(session_id)
+                if kind == "upgrade":
+                    _apply_stripe_upgrade_session(session_id)
+                else:
+                    _issue_license_for_stripe_session(session_id)
             except Exception:
                 # Ne jamais faire échouer le webhook : Stripe réessaierait en
                 # boucle. Les échecs restent consultables via
