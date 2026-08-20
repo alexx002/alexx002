@@ -664,6 +664,25 @@ class UpgradeCheckoutRequest(BaseModel):
     plan_name: str
 
 
+class PurchaseConsentRequest(BaseModel):
+    """Preuve de renoncement au délai de rétractation de 14 jours (article
+    L221-28, 13° du Code de la consommation), envoyée par le logiciel client
+    juste avant l'ouverture du navigateur vers la page de paiement Stripe —
+    que ce soit un premier achat (Payment Link statique) ou une mise à
+    niveau (session Checkout dynamique). Voir POST /purchase/consent.
+    Aucune donnée bancaire ici : uniquement la preuve que la case dédiée a
+    été cochée, horodatée côté serveur (donc non falsifiable depuis le
+    poste client)."""
+    product_code: str = Field(default=DEFAULT_PRODUCT_CODE)
+    machine_id: str = Field(default="")
+    plan_name: str
+    # "purchase" = premier achat depuis Démo (lien de paiement statique) ;
+    # "upgrade" = mise à niveau d'une licence payante existante (session
+    # Stripe Checkout dynamique). Texte libre volontairement (pas d'enum
+    # strict côté serveur) pour ne pas bloquer un futur cas non prévu ici.
+    kind: str = Field(default="purchase")
+
+
 class RsvpRegisterRequest(BaseModel):
     """Un seul enregistrement par installation cliente, au premier besoin —
     le relay_id + relay_secret renvoyés sont ensuite conservés localement.
@@ -1055,7 +1074,14 @@ def claim_demo_license(payload: DemoClaimRequest) -> dict[str, Any]:
             (
                 license_key,
                 _normalize_license_key(payload.product_code) or DEFAULT_PRODUCT_CODE,
-                DEFAULT_MAX_DEVICES,
+                # « 1 licence / 1 poste » sur la page tarifaire (même règle
+                # que l'achat en ligne Stripe ci-dessus, voir son commentaire)
+                # — bug signalé par Alex le 19/08/2026 : ce champ utilisait
+                # encore DEFAULT_MAX_DEVICES (2, pensé pour la création
+                # MANUELLE où Alex choisit lui-même le nombre de postes),
+                # ce qui donnait 2 postes à un essai gratuit censé n'en
+                # accorder qu'un seul.
+                1,
                 DEFAULT_OFFLINE_GRACE_DAYS,
                 _iso(expires_at),
                 _iso(now),
@@ -2087,6 +2113,50 @@ def _buy_page(title: str, body_html: str, refresh: bool = False) -> str:
     button {{ background:#7c4dcc; color:white; border:none; border-radius:8px; padding:10px 18px;
               font-weight:700; cursor:pointer; }}
 </style></head><body><div class="card"><h1>{_html.escape(title)}</h1>{body_html}</div></body></html>"""
+
+
+@app.post("/purchase/consent")
+def record_purchase_consent(payload: PurchaseConsentRequest, request: Request) -> dict[str, Any]:
+    """Enregistre, AVANT paiement, la preuve que le client a coché la case
+    dédiée de renoncement au délai de rétractation de 14 jours (article
+    L221-28, 13° du Code de la consommation — voir Article 6 des CGV).
+
+    Deux conditions cumulatives sont exigées par ce texte pour que la
+    renonciation soit valable : (1) l'accord préalable exprès pour une
+    exécution immédiate, et (2) la reconnaissance expresse de la perte du
+    droit de rétractation qui en découle. La case à cocher présentée côté
+    logiciel (voir ui/consent_dialog.py) porte les deux mentions ; cet
+    appel n'enregistre que le fait que la case a été cochée avant de
+    poursuivre — l'horodatage `created_at`, généré ici et non par le poste
+    client, est ce qui rend la preuve difficile à falsifier après coup.
+
+    N'exige aucun jeton (comme /license/demo-claim et /buy/links) : c'est
+    une écriture, pas une lecture de données sensibles, et elle doit
+    pouvoir avoir lieu avant qu'une licence ou une session Stripe existe.
+    Consultable ensuite via GET /admin/audit-log (event_type
+    "purchase_consent_recorded")."""
+    if _normalize_license_key(payload.product_code) != _normalize_license_key(
+            str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE)):
+        raise HTTPException(status_code=400, detail="product_code invalide.")
+    plan = str(payload.plan_name or "").strip().lower()
+    if plan not in PLAN_ALIASES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan inconnu : « {payload.plan_name} ». Attendu : {', '.join(PLAN_ORDER)}.",
+        )
+    machine_hash = _machine_fingerprint(payload.machine_id) if payload.machine_id else ""
+    now = _utc_now()
+    client_ip = str(request.client.host) if request.client else ""
+    _log_event(
+        "purchase_consent_recorded",
+        machine_hash=machine_hash,
+        details={
+            "plan_name": normalize_plan(plan),
+            "kind": str(payload.kind or "purchase").strip() or "purchase",
+            "ip": client_ip,
+        },
+    )
+    return {"ok": True, "recorded_at": _iso(now)}
 
 
 @app.get("/buy/links")
