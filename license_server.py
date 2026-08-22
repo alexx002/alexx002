@@ -13,8 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Form, Header, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
@@ -33,6 +33,15 @@ DEFAULT_LICENSE_DURATION_DAYS = 365
 # un essai à échéance courte — ses vraies limites sont déjà appliquées côté
 # logiciel, inutile de gérer une échéance serveur courte en plus.
 DEMO_CLAIM_DURATION_DAYS = 3650
+# Relais de projet (22/08/2026) : deux installations qui se partagent un même
+# projet « à tour de rôle » (jamais en simultané) via ce serveur, en mode
+# « boîte aux lettres » comme le relais RSVP — la donnée (l'archive ZIP du
+# projet) n'est jamais conservée durablement : elle est effacée dès que
+# l'autre poste l'a récupérée avec succès (voir /project/{key}/pull-ack).
+# Limite volontairement modeste : ce relais transporte une archive complète
+# (base + éventuelles photos de Galeries), pas juste du texte comme le relais
+# RSVP.
+MAX_PROJECT_RELAY_BYTES = 35 * 1024 * 1024
 
 # ── Plans, du plus bas au plus haut ─────────────────────────────────────────
 # ⚠️ DOIT RESTER SYNCHRONISÉ avec EVENT_manager/core/entitlements.py
@@ -138,6 +147,17 @@ def _random_relay_id() -> str:
 
 
 def _random_relay_secret() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _random_project_key() -> str:
+    """Identifiant opaque du relais de projet, court pour rester copiable à
+    la main si besoin (le secret, lui, ne l'est pas — voir
+    _random_project_secret)."""
+    return "PRJ-" + secrets.token_hex(4).upper()
+
+
+def _random_project_secret() -> str:
     return secrets.token_urlsafe(32)
 
 
@@ -305,6 +325,33 @@ def _ensure_schema() -> None:
                     con.execute(f"ALTER TABLE rsvp_pending ADD COLUMN {col} {ddl}")
                 except Exception:
                     pass
+        # ── Relais de projet ─────────────────────────────────────────────
+        # Permet à deux installations de se partager un même projet « à tour
+        # de rôle » sans dépendre d'un envoi manuel de fichier. Le serveur ne
+        # garde JAMAIS l'archive durablement : `blob` est NULL sauf entre un
+        # push et le pull-ack qui suit (voir MAX_PROJECT_RELAY_BYTES
+        # ci-dessus et les endpoints /project/...). `checked_out_by` est un
+        # simple repère visuel côté client (« qui a la main en ce moment »),
+        # pas un verrou technique infranchissable.
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS project_relays (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_key TEXT NOT NULL UNIQUE,
+                project_secret TEXT NOT NULL,
+                owner_activation_id TEXT NOT NULL DEFAULT '',
+                label TEXT NOT NULL DEFAULT '',
+                blob BLOB,
+                blob_size INTEGER NOT NULL DEFAULT 0,
+                blob_pushed_by TEXT NOT NULL DEFAULT '',
+                blob_pushed_at TEXT NOT NULL DEFAULT '',
+                checked_out_by TEXT NOT NULL DEFAULT '',
+                checked_out_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                last_activity_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
         # Achat automatisé (Stripe, 18/08/2026) : une ligne par session de
         # paiement traitée, pour ne créer qu'une seule licence même si
         # /buy/success et /buy/webhook arrivent tous les deux pour la même
@@ -414,6 +461,18 @@ def _require_relay_installation(con: sqlite3.Connection, relay_id: str, x_relay_
         raise HTTPException(status_code=404, detail="Installation RSVP inconnue.")
     if not secrets.compare_digest(_normalize_token(x_relay_secret), str(row["relay_secret"])):
         raise HTTPException(status_code=401, detail="Secret RSVP invalide.")
+    return row
+
+
+def _require_project_relay(con: sqlite3.Connection, project_key: str, x_project_secret: str | None) -> sqlite3.Row:
+    row = con.execute(
+        "SELECT * FROM project_relays WHERE project_key=?",
+        (str(project_key or "").strip(),),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Relais de projet inconnu.")
+    if not secrets.compare_digest(_normalize_token(x_project_secret), str(row["project_secret"])):
+        raise HTTPException(status_code=401, detail="Secret du relais de projet invalide.")
     return row
 
 
@@ -701,6 +760,20 @@ class RsvpAnswerRequest(BaseModel):
     juste sa réponse. Le serveur ne connaît ni son nom ni son e-mail."""
     answer: str
     comment: str = Field(default="")
+
+
+class ProjectRelayCreateRequest(BaseModel):
+    """Même logique d'authentification que RsvpRegisterRequest : par
+    activation_id, jamais par la clé de licence en clair."""
+    product_code: str = Field(default=DEFAULT_PRODUCT_CODE)
+    activation_id: str = Field(default="")
+    machine_id: str = Field(default="")
+    label: str = Field(default="")
+    holder_name: str = Field(default="")
+
+
+class ProjectRelayPullAckRequest(BaseModel):
+    holder_name: str = Field(default="")
 
 
 _ensure_schema()
@@ -3240,6 +3313,143 @@ def _rsvp_invalid_page(message: str) -> str:
       <p class="greet">{message}</p>
     """
     return _rsvp_html_page("Lien invalide", body)
+
+
+@app.post("/project/create")
+def project_relay_create(payload: ProjectRelayCreateRequest) -> dict[str, Any]:
+    """Crée un nouveau relais de projet. Ne transporte encore aucune donnée :
+    le poste créateur doit ensuite appeler /project/{key}/push pour que
+    l'autre poste ait quelque chose à récupérer (voir la doc du client)."""
+    if _normalize_license_key(payload.product_code) != _normalize_license_key(str(SETTINGS.get("product_code") or DEFAULT_PRODUCT_CODE)):
+        raise HTTPException(status_code=400, detail="product_code invalide.")
+
+    machine_hash = _machine_fingerprint(payload.machine_id) if payload.machine_id else ""
+    now = _utc_now()
+
+    with _db() as con:
+        license_row = _license_row_from_activation(con, payload.activation_id, machine_hash)
+        status_error = _license_status_error(license_row)
+        if status_error:
+            raise HTTPException(status_code=403, detail=f"Licence {status_error}.")
+
+        project_key = _random_project_key()
+        project_secret = _random_project_secret()
+        con.execute(
+            """
+            INSERT INTO project_relays(
+                project_key, project_secret, owner_activation_id, label,
+                checked_out_by, checked_out_at, created_at, last_activity_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_key, project_secret, payload.activation_id.strip(),
+                payload.label.strip(), payload.holder_name.strip(), _iso(now),
+                _iso(now), _iso(now),
+            ),
+        )
+        _log_event(
+            "project_relay_create",
+            activation_id=payload.activation_id.strip(),
+            machine_hash=machine_hash,
+            details={"project_key": project_key, "label": payload.label.strip()},
+            con=con,
+        )
+        return {"ok": True, "project_key": project_key, "project_secret": project_secret}
+
+
+@app.post("/project/{project_key}/push")
+def project_relay_push(
+    project_key: str,
+    file: UploadFile = File(...),
+    holder_name: str = Form(default=""),
+    x_project_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Dépose la dernière version du projet (archive ZIP) sur le relais, prête
+    à être récupérée par l'autre poste. `checked_out_by` est vidé : personne
+    n'a « la main » tant que le pull-ack n'a pas eu lieu de l'autre côté."""
+    data = file.file.read()
+    if len(data) > MAX_PROJECT_RELAY_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Projet trop volumineux pour le relais cloud "
+                f"({len(data) / (1024*1024):.1f} Mo, limite {MAX_PROJECT_RELAY_BYTES // (1024*1024)} Mo) "
+                f"— souvent à cause des photos dans Galeries. Utilise l'export/import manuel (fichier ZIP) pour ce transfert."
+            ),
+        )
+    now = _utc_now()
+    with _db() as con:
+        row = _require_project_relay(con, project_key, x_project_secret)
+        con.execute(
+            """
+            UPDATE project_relays
+            SET blob=?, blob_size=?, blob_pushed_by=?, blob_pushed_at=?,
+                checked_out_by='', checked_out_at='', last_activity_at=?
+            WHERE project_key=?
+            """,
+            (data, len(data), holder_name.strip(), _iso(now), _iso(now), str(row["project_key"])),
+        )
+        return {"ok": True, "blob_size": len(data)}
+
+
+@app.get("/project/{project_key}/pull")
+def project_relay_pull(project_key: str, x_project_secret: str | None = Header(default=None)) -> Response:
+    """Renvoie l'archive en attente, SANS l'effacer — l'effacement n'a lieu
+    qu'après confirmation de bonne réception via /pull-ack, pour ne rien
+    perdre si le téléchargement échoue en cours de route."""
+    with _db() as con:
+        row = _require_project_relay(con, project_key, x_project_secret)
+        if row["blob"] is None:
+            raise HTTPException(status_code=404, detail="Rien à récupérer pour ce projet en ce moment.")
+        return Response(
+            content=bytes(row["blob"]),
+            media_type="application/zip",
+            headers={
+                "X-Pushed-By": str(row["blob_pushed_by"] or ""),
+                "X-Pushed-At": str(row["blob_pushed_at"] or ""),
+            },
+        )
+
+
+@app.post("/project/{project_key}/pull-ack")
+def project_relay_pull_ack(
+    project_key: str, payload: ProjectRelayPullAckRequest,
+    x_project_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Confirme la récupération réussie : efface l'archive du serveur (jamais
+    conservée durablement, même principe que le relais RSVP) et marque le
+    poste qui vient de récupérer comme ayant désormais « la main »."""
+    now = _utc_now()
+    with _db() as con:
+        row = _require_project_relay(con, project_key, x_project_secret)
+        if row["blob"] is None:
+            raise HTTPException(status_code=409, detail="Rien à confirmer : aucune archive en attente.")
+        con.execute(
+            """
+            UPDATE project_relays
+            SET blob=NULL, blob_size=0, checked_out_by=?, checked_out_at=?, last_activity_at=?
+            WHERE project_key=?
+            """,
+            (payload.holder_name.strip(), _iso(now), _iso(now), str(row["project_key"])),
+        )
+        return {"ok": True}
+
+
+@app.get("/project/{project_key}/status")
+def project_relay_status(project_key: str, x_project_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    with _db() as con:
+        row = _require_project_relay(con, project_key, x_project_secret)
+        return {
+            "ok": True,
+            "label": str(row["label"] or ""),
+            "has_pending": row["blob"] is not None,
+            "pending_size": int(row["blob_size"] or 0),
+            "pushed_by": str(row["blob_pushed_by"] or ""),
+            "pushed_at": str(row["blob_pushed_at"] or ""),
+            "checked_out_by": str(row["checked_out_by"] or ""),
+            "checked_out_at": str(row["checked_out_at"] or ""),
+            "created_at": str(row["created_at"] or ""),
+        }
 
 
 @app.post("/rsvp/register")
