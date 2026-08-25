@@ -42,6 +42,18 @@ DEMO_CLAIM_DURATION_DAYS = 3650
 # (base + éventuelles photos de Galeries), pas juste du texte comme le relais
 # RSVP.
 MAX_PROJECT_RELAY_BYTES = 35 * 1024 * 1024
+# Boîte aux lettres « photos d'invités » (25/08/2026) : un invité peut
+# déposer une photo (QR code sur la galerie, sans compte ni mot de passe)
+# même quand le PC de l'organisateur est éteint — même principe de dépôt
+# transitoire que le relais RSVP et le relais de projet ci-dessus, jamais
+# conservé durablement (effacé dès que l'organisateur l'a récupéré). Deux
+# plafonds volontairement modestes, sur le même ordre de grandeur que
+# MAX_PROJECT_RELAY_BYTES : par photo (une photo de téléphone tient
+# largement dedans — le client la recompresse de toute façon avant envoi)
+# et en attente cumulée par galerie partagée (le temps que l'organisateur
+# se reconnecte et récupère).
+MAX_GALLERY_PHOTO_BYTES = 8 * 1024 * 1024
+MAX_GALLERY_PENDING_BYTES = 60 * 1024 * 1024
 
 # ── Plans, du plus bas au plus haut ─────────────────────────────────────────
 # ⚠️ DOIT RESTER SYNCHRONISÉ avec EVENT_manager/core/entitlements.py
@@ -325,6 +337,26 @@ def _ensure_schema() -> None:
                     con.execute(f"ALTER TABLE rsvp_pending ADD COLUMN {col} {ddl}")
                 except Exception:
                     pass
+        # ── Boîte aux lettres « photos d'invités » ───────────────────────────
+        # Un jeton par galerie partagée (généré et gardé côté client, voir
+        # web/server.py::_ensure_gallery_token) — le serveur ne sait jamais à
+        # quelle galerie ni à quel événement il correspond, seulement qu'il
+        # appartient à cette installation (relay_id). Réutilise directement
+        # rsvp_installations : même identité d'installation que le relais
+        # RSVP, pas besoin d'un second enregistrement.
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gallery_pending (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                relay_id TEXT NOT NULL,
+                gallery_token TEXT NOT NULL,
+                data BLOB NOT NULL,
+                content_type TEXT NOT NULL DEFAULT 'image/jpeg',
+                size INTEGER NOT NULL DEFAULT 0,
+                submitted_at TEXT NOT NULL
+            )
+            """
+        )
         # ── Relais de projet ─────────────────────────────────────────────
         # Permet à deux installations de se partager un même projet « à tour
         # de rôle » sans dépendre d'un envoi manuel de fichier. Le serveur ne
@@ -3655,6 +3687,192 @@ def rsvp_submit(relay_id: str, t: str = "", answer: str = Form(...), comment: st
         )
         _log_event("rsvp_answer_received", details={"relay_id": relay_id, "answer": answer}, con=con)
     return HTMLResponse(_rsvp_confirm_page(answer))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Boîte aux lettres « photos d'invités » (25/08/2026)
+#
+# Un invité scanne un QR code sur une galerie partagée et dépose une photo
+# depuis son téléphone, sans compte ni application — même quand le PC de
+# l'organisateur est éteint. Réutilise l'identité d'installation du relais
+# RSVP ci-dessus (même relay_id/relay_secret, pas de second enregistrement) ;
+# seul un jeton opaque par galerie (gallery_token, généré et gardé côté
+# client) distingue une galerie d'une autre — le serveur ne sait jamais à
+# quel événement ni à quelle galerie il correspond.
+#
+# Dépôt transitoire uniquement, comme le relais RSVP et le relais de projet :
+# une photo n'existe côté serveur qu'entre le dépôt de l'invité et l'accusé
+# de réception de l'organisateur (voir /photos/sync/{relay_id}/ack), jamais
+# conservée durablement.
+# ═══════════════════════════════════════════════════════════════════════════
+
+class GalleryAckRequest(BaseModel):
+    ids: list[int] = Field(default_factory=list)
+
+
+def _gallery_pending_total(con: sqlite3.Connection, relay_id: str, gallery_token: str) -> int:
+    row = con.execute(
+        "SELECT COALESCE(SUM(size), 0) AS n FROM gallery_pending WHERE relay_id=? AND gallery_token=?",
+        (relay_id, gallery_token),
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def _photo_upload_page(relay_id: str, gallery_token: str) -> str:
+    from urllib.parse import quote
+    action = f"/{quote(str(relay_id), safe='')}/photos?t={quote(str(gallery_token), safe='')}"
+    body = f"""
+      <h1>Partagez vos photos</h1>
+      <p class="greet">Ajoutez une ou plusieurs photos à l'album de l'événement,
+      directement depuis votre téléphone.</p>
+      <input type="file" id="f" accept="image/*" multiple style="display:none">
+      <button type="button" onclick="document.getElementById('f').click()">📷 Choisir des photos</button>
+      <div id="status" style="margin-top:16px"></div>
+      <p class="hint">Vous pouvez revenir sur ce lien à tout moment pour en ajouter d'autres.</p>
+    <script>
+      var ACTION = {json.dumps(action)};
+      var el = document.getElementById('f'), st = document.getElementById('status');
+      el.addEventListener('change', function() {{
+        var files = Array.prototype.slice.call(el.files || []);
+        if (!files.length) return;
+        st.innerHTML = '';
+        files.forEach(function(file, i) {{
+          var line = document.createElement('p');
+          line.className = 'hint';
+          line.style.margin = '6px 0';
+          line.textContent = 'Envoi de ' + (file.name || ('photo ' + (i + 1))) + '…';
+          st.appendChild(line);
+          var fd = new FormData();
+          fd.append('file', file, file.name || 'photo.jpg');
+          fetch(ACTION, {{ method: 'POST', body: fd }})
+            .then(function(r) {{ return r.json().then(function(j) {{ return {{ok: r.ok, j: j}}; }}); }})
+            .then(function(res) {{
+              line.textContent = res.ok
+                ? '✅ ' + (file.name || 'Photo') + ' envoyée.'
+                : '⚠️ ' + (file.name || 'Photo') + ' — ' + (res.j.detail || 'échec de l\\'envoi.');
+            }})
+            .catch(function() {{ line.textContent = '⚠️ ' + (file.name || 'Photo') + ' — échec de l\\'envoi.'; }});
+        }});
+        el.value = '';
+      }});
+    </script>
+    """
+    return _rsvp_html_page("Partagez vos photos", body)
+
+
+@app.get("/{relay_id}/photos", response_class=HTMLResponse)
+def gallery_photo_form(relay_id: str, t: str = "") -> HTMLResponse:
+    token = str(t or "").strip()
+    with _db() as con:
+        installation = con.execute(
+            "SELECT 1 FROM rsvp_installations WHERE relay_id=?", (str(relay_id or "").strip(),)
+        ).fetchone()
+        if installation is None:
+            return HTMLResponse(_rsvp_invalid_page("Ce lien ne correspond à aucun événement connu."), status_code=404)
+        if not token:
+            return HTMLResponse(_rsvp_invalid_page("Lien incomplet (jeton manquant)."), status_code=400)
+    return HTMLResponse(_photo_upload_page(relay_id, token))
+
+
+@app.post("/{relay_id}/photos")
+def gallery_photo_submit(relay_id: str, t: str = "", file: UploadFile = File(...)) -> dict[str, Any]:
+    token = str(t or "").strip()
+    data = file.file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Fichier vide.")
+    if len(data) > MAX_GALLERY_PHOTO_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Photo trop volumineuse ({len(data) / (1024*1024):.1f} Mo, "
+                f"limite {MAX_GALLERY_PHOTO_BYTES // (1024*1024)} Mo)."
+            ),
+        )
+    now = _utc_now()
+    with _db() as con:
+        installation = con.execute(
+            "SELECT 1 FROM rsvp_installations WHERE relay_id=?", (str(relay_id or "").strip(),)
+        ).fetchone()
+        if installation is None:
+            raise HTTPException(status_code=404, detail="Ce lien ne correspond à aucun événement connu.")
+        if not token:
+            raise HTTPException(status_code=400, detail="Lien incomplet (jeton manquant).")
+        pending_total = _gallery_pending_total(con, relay_id, token)
+        if pending_total + len(data) > MAX_GALLERY_PENDING_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Trop de photos en attente pour cette galerie — l'organisateur doit "
+                    "d'abord se reconnecter pour les récupérer avant que d'autres puissent "
+                    "être déposées. Réessayez un peu plus tard."
+                ),
+            )
+        con.execute(
+            """
+            INSERT INTO gallery_pending(relay_id, gallery_token, data, content_type, size, submitted_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (relay_id, token, data, str(file.content_type or "image/jpeg"), len(data), _iso(now)),
+        )
+        _log_event(
+            "gallery_photo_received",
+            details={"relay_id": relay_id, "size": len(data)},
+            con=con,
+        )
+    return {"ok": True, "size": len(data)}
+
+
+# Routes /photos/sync/... déclarées séparément de /{relay_id}/photos (même
+# précaution que /rsvp/sync/... vis-à-vis de /{relay_id}/rsvp ci-dessus) :
+# préfixe littéral "photos" en premier segment, jamais confondu avec un
+# relay_id.
+@app.get("/photos/sync/{relay_id}")
+def gallery_sync(relay_id: str, x_relay_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    """Métadonnées seules (jamais les octets de l'image ici, pour rester
+    léger même avec beaucoup de photos en attente) — voir
+    /photos/sync/{relay_id}/{photo_id} pour récupérer chaque photo."""
+    with _db() as con:
+        _require_relay_installation(con, relay_id, x_relay_secret)
+        rows = con.execute(
+            "SELECT id, gallery_token, content_type, size, submitted_at "
+            "FROM gallery_pending WHERE relay_id=? ORDER BY id",
+            (relay_id,),
+        ).fetchall()
+        items = [
+            {
+                "id": int(r["id"]),
+                "gallery_token": str(r["gallery_token"]),
+                "content_type": str(r["content_type"] or "image/jpeg"),
+                "size": int(r["size"] or 0),
+                "submitted_at": str(r["submitted_at"]),
+            }
+            for r in rows
+        ]
+        return {"ok": True, "items": items}
+
+
+@app.get("/photos/sync/{relay_id}/{photo_id}")
+def gallery_sync_photo(relay_id: str, photo_id: int, x_relay_secret: str | None = Header(default=None)) -> Response:
+    with _db() as con:
+        _require_relay_installation(con, relay_id, x_relay_secret)
+        row = con.execute(
+            "SELECT data, content_type FROM gallery_pending WHERE relay_id=? AND id=?",
+            (relay_id, photo_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Photo introuvable (déjà récupérée ?).")
+        return Response(content=bytes(row["data"]), media_type=str(row["content_type"] or "image/jpeg"))
+
+
+@app.post("/photos/sync/{relay_id}/ack")
+def gallery_sync_ack(relay_id: str, payload: GalleryAckRequest, x_relay_secret: str | None = Header(default=None)) -> dict[str, Any]:
+    with _db() as con:
+        _require_relay_installation(con, relay_id, x_relay_secret)
+        deleted = 0
+        for pid in payload.ids or []:
+            cur = con.execute("DELETE FROM gallery_pending WHERE relay_id=? AND id=?", (relay_id, int(pid)))
+            deleted += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        return {"ok": True, "deleted": deleted}
 
 
 if __name__ == "__main__":
