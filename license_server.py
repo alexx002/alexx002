@@ -3717,38 +3717,63 @@ def _gallery_pending_total(con: sqlite3.Connection, relay_id: str, gallery_token
 
 
 def _photo_upload_page(relay_id: str, token: str) -> str:
+    # 27/08/2026, retour d'Alex : cette page (boîte aux lettres en ligne) ne
+    # se présentait pas comme la page du mode « envoi direct »
+    # (ui/rsvp_portal.py::_page_gallery_upload) — bouton différent, ET le
+    # bouton de fichier ouvrait directement l'appareil photo au lieu de
+    # laisser choisir dans la pellicule (attribut capture="environment",
+    # retiré ci-dessous). Reprend maintenant exactement la même structure :
+    # bouton vert masquant un input file caché, envoi automatique dès le
+    # choix des photos (plus de bouton « Envoyer » séparé), styles identiques
+    # (couleurs codées en dur ici faute de feuille de style commune aux deux
+    # fichiers). Si l'un des deux change, reporter le changement sur l'autre.
     from urllib.parse import quote
     action = f"/{quote(str(relay_id), safe='')}/photos?t={quote(str(token), safe='')}"
     body = f"""
       <h1>Partagez vos photos</h1>
-      <p class="greet">Ajoutez une ou plusieurs photos de la soirée, elles seront envoyées à l'organisateur.</p>
-      <p class="hint">📶 Pas besoin du wifi de la salle : ça fonctionne avec votre connexion mobile.</p>
-      <form method="post" action="{action}" enctype="multipart/form-data" id="f">
-        <input type="file" name="file" accept="image/*" capture="environment" id="file" multiple>
-        <button type="submit">Envoyer</button>
-      </form>
-      <p class="hint" id="statut"></p>
+      <p style="text-align:center;color:var(--muted);font-size:15px;margin:18px 0 14px">
+        Ajoutez une ou plusieurs photos de la soirée, elles seront envoyées à l'organisateur.</p>
+      <p style="text-align:center;color:var(--muted);font-size:13px;margin:0 0 12px">
+        📶 L'envoi de photos peut utiliser vos données mobiles.</p>
+      <input type="file" id="file" accept="image/*" multiple style="display:none">
+      <button type="button" style="display:block;width:100%;text-align:center;padding:15px;
+        border-radius:13px;font-size:16px;font-weight:700;border:none;cursor:pointer;font:inherit;
+        background:linear-gradient(180deg,#3fbf72,#2f9e5c);color:#fff;
+        box-shadow:0 8px 18px rgba(47,158,92,.28)"
+        onclick="document.getElementById('file').click()">📷 Choisir des photos</button>
+      <div id="statut" style="margin-top:14px"></div>
+      <p style="text-align:center;color:#b6a996;font-size:12px;margin-top:22px">
+        Vous pouvez revenir sur ce lien à tout moment pour en ajouter d'autres.</p>
       <script>
-        // Envoie chaque fichier sélectionné un par un (le serveur n'accepte
-        // qu'un seul fichier par requête), pour rester simple côté serveur.
-        var form = document.getElementById('f');
-        form.addEventListener('submit', function (ev) {{
-          ev.preventDefault();
-          var files = document.getElementById('file').files;
-          if (!files || !files.length) return;
-          var statut = document.getElementById('statut');
-          var i = 0, ok = 0;
+        // Envoi séquentiel, une photo à la fois (le serveur n'accepte qu'un
+        // seul fichier par requête, et un envoi en parallèle est plus
+        // fragile sur une connexion mobile — voir le mode « envoi direct »
+        // pour le même choix).
+        var fileEl = document.getElementById('file'), statut = document.getElementById('statut');
+        fileEl.addEventListener('change', function () {{
+          var files = Array.prototype.slice.call(fileEl.files || []);
+          if (!files.length) return;
+          statut.innerHTML = '';
+          var i = 0;
           function next() {{
-            if (i >= files.length) {{
-              statut.textContent = ok + ' photo(s) envoyée(s) sur ' + files.length + '.';
-              return;
-            }}
-            statut.textContent = 'Envoi ' + (i + 1) + '/' + files.length + '…';
+            if (i >= files.length) return;
+            var file = files[i], idx = i;
+            i++;
+            var line = document.createElement('p');
+            line.style.cssText = 'text-align:center;color:var(--muted);font-size:13px;margin:0 0 6px';
+            line.textContent = 'Envoi de ' + (file.name || ('photo ' + (idx + 1))) + '…';
+            statut.appendChild(line);
             var fd = new FormData();
-            fd.append('file', files[i]);
+            fd.append('file', file);
             fetch('{action}', {{ method: 'POST', body: fd }})
-              .then(function (r) {{ if (r.ok) ok++; i++; next(); }})
-              .catch(function () {{ i++; next(); }});
+              .then(function (r) {{ return r.json().then(function (j) {{ return {{ok: r.ok, j: j}}; }}); }})
+              .then(function (res) {{
+                line.textContent = res.ok
+                  ? '✅ ' + (file.name || 'Photo') + ' envoyée.'
+                  : '⚠️ ' + (file.name || 'Photo') + ' — ' + (res.j.detail || "échec de l'envoi.");
+              }})
+              .catch(function () {{ line.textContent = '⚠️ ' + (file.name || 'Photo') + " — échec de l'envoi."; }})
+              .then(next);
           }}
           next();
         }});
