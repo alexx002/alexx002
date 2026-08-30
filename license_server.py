@@ -203,6 +203,14 @@ def _db() -> sqlite3.Connection:
     _ensure_parent(DB_PATH)
     con = sqlite3.connect(str(DB_PATH))
     con.row_factory = sqlite3.Row
+    # 30/08/2026 : sans ce délai, une connexion qui tombe sur la base déjà
+    # verrouillée par une autre requête simultanée (upload de photo, RSVP,
+    # vérification de licence...) lève immédiatement "database is locked" au
+    # lieu d'attendre — ce qui remonte comme une erreur 500 non-JSON côté
+    # client et s'affiche en clair comme "échec de l'envoi." sans aucun
+    # détail utile. On attend désormais jusqu'à 5 s que le verrou se libère
+    # avant d'abandonner.
+    con.execute("PRAGMA busy_timeout = 5000")
     try:
         yield con
         con.commit()
@@ -809,6 +817,26 @@ _ensure_schema()
 _seed_demo_license()
 
 app = FastAPI(title=APP_TITLE)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    # 30/08/2026 : sans ce filet, une exception non prévue (verrou base de
+    # données, disque plein, etc.) remonte comme une page d'erreur 500 en
+    # texte brut plutôt qu'en JSON. Les pages invité (envoi de photo, RSVP)
+    # font toutes `r.json()` sur la réponse : une réponse non-JSON fait
+    # planter cette lecture et s'affiche comme un échec générique sans aucun
+    # détail exploitable (ex. "échec de l'envoi."), masquant la vraie cause.
+    # On répond désormais toujours en JSON, avec un statut 500 et un message
+    # générique, pour que ces pages affichent au moins un message cohérent
+    # et qu'on puisse retrouver la trace complète dans les logs du serveur.
+    from fastapi.responses import JSONResponse
+    import traceback
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Erreur inattendue du serveur, réessayez dans un instant."},
+    )
 
 
 @app.get("/health")
